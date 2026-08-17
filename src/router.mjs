@@ -79,7 +79,7 @@ export class RouteAffinity {
   }
 }
 
-export function routeResponsesRequest(source, { mainModel, visionModel, affinity, knownModels }) {
+export function routeResponsesRequest(source, { mainModel, visionModel, affinity, knownModels, modelSeesImages }) {
   const current = currentTurnItems(source?.input);
   const requested = source?.model;
   const pinned = affinity?.consumeFrom(current);
@@ -97,7 +97,20 @@ export function routeResponsesRequest(source, { mainModel, visionModel, affinity
     return { model: visionModel, reason: "vision_model_requested", directVision: true };
   }
   if (hasImage(current)) {
-    return { model: visionModel, reason: "current_turn_image", directVision: true };
+    // Escalation exists for the text-only models: they cannot read the image at
+    // all, so the turn is routed to the vision model instead. A model that can
+    // see keeps its own turn - hijacking it would spend the vision model's quota
+    // on an extra upstream call and move the image out of the conversation the
+    // user selected. modelSeesImages is optional; without it every image
+    // escalates, which is the pre-existing behaviour.
+    // No vision model configured (set to None, or no enabled provider owns one):
+    // escalating anyway routed the turn to model:"" which resolves to the active
+    // profile, so the request silently hit the dashboard provider with an empty
+    // model id. Keep the turn where it belongs instead.
+    const target = requested && knownModels?.has(requested) ? requested : mainModel;
+    if (visionModel && !modelSeesImages?.(target)) {
+      return { model: visionModel, reason: "current_turn_image", directVision: true };
+    }
   }
   // Codex's own model picker is populated from the catalog this gate publishes, so a
   // model id we recognise is a deliberate choice by the user in that picker - honour it

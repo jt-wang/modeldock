@@ -323,9 +323,19 @@ export function loadConfig() {
   const customModel = String(process.env.MODELDOCK_CUSTOM_MODEL || "").trim();
   const customMain = ["1", "true", "on", "yes"].includes(String(process.env.MODELDOCK_CUSTOM_MAIN || "").toLowerCase());
   const customVision = ["1", "true", "on", "yes"].includes(String(process.env.MODELDOCK_CUSTOM_VISION || "").toLowerCase());
+  // Both speak the Responses wire natively, so they are ordinary providers: an
+  // env value (or the .env fallback applyEnvFile already loaded) is the token.
+  // MODELDOCK_-prefixed names win: the bare ZAI_API_KEY / KIMI_API_KEY are common
+  // enough that another tool may already export them for a different account -
+  // this machine had KIMI_API_KEY pointing at an OpenCode key - and a real env
+  // var outranks the .env file, so an unprefixed collision would silently win.
+  const zaiToken = process.env.MODELDOCK_ZAI_API_KEY || process.env.ZAI_API_KEY || "";
+  const kimiToken = process.env.MODELDOCK_KIMI_API_KEY || process.env.KIMI_API_KEY || "";
   const tokens = {
     "opencode-go": opencodeGoToken,
     "deepseek-official": deepseekToken,
+    ...(zaiToken ? { zai: zaiToken } : {}),
+    ...(kimiToken ? { kimi: kimiToken } : {}),
     ...(customApiKey ? { custom: customApiKey } : {}),
   };
 

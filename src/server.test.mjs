@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import { randomBytes } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createApp, createServices, startServer, initAutostartDefault, codexModelCatalog, decodeZstdBody } from "./server.mjs";
 import { OPENCODE_GO_PROFILE, DEEPSEEK_OFFICIAL_PROFILE } from "./profiles.mjs";
@@ -65,6 +66,12 @@ async function startApp(configOverrides = {}) {
     const dir = await mkdtemp(path.join(os.tmpdir(), "modeldock-catalog-test-"));
     config.codexCatalogFile = config.codexCatalogFile || path.join(dir, "codex-model-catalog.json");
     config.nativeCatalogFile = config.nativeCatalogFile || path.join(dir, "native-catalog.json");
+  }
+  // The reasoning ladder is gated on the captured Codex version, so a run with
+  // no capture would serve the pre-0.138 fallback ladder. Declare a current
+  // client (and no models, so nothing is merged) unless a test says otherwise.
+  if (!existsSync(config.nativeCatalogFile)) {
+    writeFileSync(config.nativeCatalogFile, JSON.stringify({ captured_with: "0.145.0", models: [] }), "utf8");
   }
   const services = createServices(config);
   const { app } = createApp(services);
@@ -273,7 +280,9 @@ test("models endpoint serves the local Codex catalog", async (t) => {
   const body = await response.json();
   assert.equal(body.models[0].slug, "deepseek-v4-flash@opencode-go");
   assert.equal(body.models[0].supports_parallel_tool_calls, false);
-  assert.deepEqual(body.models[0].supported_reasoning_levels.map((level) => level.effort), ["low", "high", "xhigh"]);
+  // deepseek-v4-flash carries DeepSeek's own documented ladder (low/high/max),
+  // not the profile-level default.
+  assert.deepEqual(body.models[0].supported_reasoning_levels.map((level) => level.effort), ["low", "high", "max"]);
   assert.match(body.models[0].base_instructions, /coding agent/);
 });
 
