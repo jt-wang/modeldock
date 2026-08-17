@@ -1,4 +1,4 @@
-import { bareModelId, providerForModel, tokenFor, profileById } from "./profiles.mjs";
+import { bareModelId, modelEntryFor, providerForModel, tokenFor, profileById } from "./profiles.mjs";
 import { VISION_EVIDENCE_INSTRUCTIONS, VISION_EVIDENCE_MAX_CHARS } from "./vision-evidence.mjs";
 import { visionCacheKey, visionEvidenceCache } from "./vision-cache.mjs";
 function upstreamUrl(baseUrl, path) {
@@ -146,7 +146,15 @@ export function createUpstreams({ config, metrics, mediaStore, memoryStore = nul
     const common = { model: bareModelId(model), max_output_tokens: 4_096, stream: false };
     if (style === "responses") {
       const content = [{ type: "input_text", text: prompt }];
-      for (const image of images) content.push({ type: "input_image", image_url: image.imageUrl });
+      // Same per-model shape rule as the relay path: some upstreams reject a
+      // bare-string image_url on the Responses wire and require { url }.
+      const shape = modelEntryFor(config, model)?.imageUrlShape;
+      for (const image of images) {
+        content.push({
+          type: "input_image",
+          image_url: shape === "object" ? { url: image.imageUrl } : image.imageUrl,
+        });
+      }
       common.input = [{ role: "user", content }];
     } else {
       const content = [{ type: "text", text: prompt }];

@@ -123,10 +123,18 @@ export function nativeModelSlugs(config) {
   return slugs;
 }
 
+// `codex --version` prints a banner ("codex-cli 0.145.0"), so the version is the
+// first dotted-numeric token rather than the first token. Anything unrecognised
+// becomes "", which callers must read as "unknown" and handle conservatively -
+// guessing a version here is worse than admitting we do not have one.
+export function parseCodexVersion(output) {
+  const match = /(?:^|\s)(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)(?=\s|$)/.exec(String(output ?? "").trim());
+  return match ? match[1] : "";
+}
+
 export async function codexVersion() {
   try {
-    const out = await runCodex(["--version"], 5_000);
-    return String(out || "").trim().split(/\s+/)[0] || "";
+    return parseCodexVersion(await runCodex(["--version"], 5_000));
   } catch {
     return "";
   }

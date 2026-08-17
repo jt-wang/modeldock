@@ -7,9 +7,8 @@ import {
   profileById,
   profileOptions,
   applyCustomProfile,
-  CONTEXT_WINDOW,
+  contextWindowDefault,
   AUTO_COMPACT_PERCENT,
-  AUTO_COMPACT_TOKEN_LIMIT,
 } from "./profiles.mjs";
 
 test("publishedSlugFor owner-qualifies every owned model", () => {
@@ -34,7 +33,7 @@ test("exposes every registered profile through the registry", () => {
 
 test("lists all profiles as selectable options", () => {
   const options = profileOptions();
-  assert.deepEqual(options.map((option) => option.id), ["opencode-go", "deepseek-official", "custom"]);
+  assert.deepEqual(options.map((option) => option.id), ["opencode-go", "deepseek-official", "zai", "kimi", "custom"]);
   assert.ok(options.every((option) => typeof option.label === "string" && option.label.length > 0));
 });
 
@@ -77,21 +76,24 @@ test("model catalog is generated per profile with distinct comp hashes", () => {
   assert.equal(goCatalog.models[0].comp_hash, "modeldock-opencode-go-v1");
   assert.equal(goCatalog.models[0].supports_search_tool, false);
   assert.equal(goCatalog.models[0].default_reasoning_level, "high");
-  assert.deepEqual(goCatalog.models[0].supported_reasoning_levels.map((level) => level.effort), ["low", "high", "xhigh"]);
+  // deepseek-v4-flash now carries DeepSeek's documented ladder rather than the
+  // profile-level default.
+  assert.deepEqual(goCatalog.models[0].supported_reasoning_levels.map((level) => level.effort), ["low", "high", "max"]);
   assert.equal(officialCatalog.models[0].comp_hash, "modeldock-deepseek-official-v1");
   assert.equal(officialCatalog.models[0].supports_search_tool, false);
-  assert.equal(officialCatalog.models[0].default_reasoning_level, "medium", "DeepSeek official defaults to medium thinking");
+  assert.equal(officialCatalog.models[0].default_reasoning_level, "high", "DeepSeek documents high as the default effort");
   assert.deepEqual(
     officialCatalog.models[0].supported_reasoning_levels.map((level) => level.effort),
-    ["none", "minimal", "low", "medium", "high", "xhigh"],
-    "DeepSeek official accepts its full reasoning effort ladder",
+    ["low", "high", "max"],
+    "DeepSeek documents three rungs; none/minimal/medium/xhigh are aliases",
   );
   assert.notEqual(goCatalog.models[0].comp_hash, officialCatalog.models[0].comp_hash);
 });
 
 test("every profile compacts at 80% of the model context window", () => {
-  const expected = Math.floor(CONTEXT_WINDOW * AUTO_COMPACT_PERCENT);
-  assert.equal(AUTO_COMPACT_TOKEN_LIMIT, expected);
+  // The default itself is exercised by the catalog test that sets
+  // MODELDOCK_CONTEXT_WINDOW; here the point is that an explicit per-model
+  // window drives the limit, not the default.
   for (const profile of [OPENCODE_GO_PROFILE, DEEPSEEK_OFFICIAL_PROFILE]) {
     const catalog = profile.modelCatalog({ mainModel: "deepseek-v4-flash", baseInstructions: "base" });
     const model = catalog.models[0];
@@ -101,3 +103,22 @@ test("every profile compacts at 80% of the model context window", () => {
   }
 });
 
+
+test("the MiMo family publishes no reasoning ladder, because the endpoint ignores it", () => {
+  // Measured 2026-08-18 through the gateway against OpenCode Go. mimo-v2.5 and
+  // mimo-v2.5-pro return 200 for every effort including `ultra` AND for the
+  // bogus value "banana", and report no reasoning_tokens at any rung while
+  // output tokens scatter with no trend (97/420/279/165...). deepseek-v4-flash
+  // on the same provider 400s on "banana", so the endpoint validates when the
+  // model actually supports the parameter - MiMo simply drops it.
+  // mimo-v2.5-free was rate-limited (429) at measurement time; it is the free
+  // tier of the same model on the same endpoint and is configured to match its
+  // measured twins rather than left on a fallback ladder that was never real.
+  const go = profileById("opencode-go");
+  for (const id of ["mimo-v2.5", "mimo-v2.5-pro", "mimo-v2.5-free"]) {
+    const entry = go.availableModels.find((model) => model.id === id);
+    assert.ok(entry, `${id} is published`);
+    assert.equal(entry.reasoningEffortSupported, false, `${id} must not forward reasoning_effort`);
+    assert.deepEqual(entry.reasoningEfforts, ["high"], `${id} publishes one cosmetic rung`);
+  }
+});

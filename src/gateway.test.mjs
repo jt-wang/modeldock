@@ -33,6 +33,8 @@ import {
   routeGatewayRequest,
   sessionIdsFrom,
   upstreamTargetFor,
+  hiddenToolsFor,
+  adaptImageUrlShape,
 } from "./gateway.mjs";
 
 function configStub() {
@@ -664,6 +666,27 @@ test("upstreamTargetFor routes by owning provider", () => {
   assert.equal(legacyUnderDeepseekProfile.token, "go-token");
 });
 
+test("upstreamTargetFor routes the z.ai and Kimi profiles to their own endpoints", () => {
+  // Both providers speak the Responses wire natively, so they are ordinary
+  // profiles: the registry supplies the base URL and the per-provider token.
+  const config = {
+    ...configStub(),
+    tokens: { "opencode-go": "go-token", "deepseek-official": "ds-token", zai: "zai-token", kimi: "kimi-token" },
+  };
+
+  const zai = upstreamTargetFor(config, "glm-5.3@zai");
+  assert.equal(zai.provider, "zai");
+  assert.equal(zai.model, "glm-5.3");
+  assert.equal(zai.url, "https://api.z.ai/api/v1/responses");
+  assert.equal(zai.token, "zai-token");
+
+  const kimi = upstreamTargetFor(config, "k3@kimi");
+  assert.equal(kimi.provider, "kimi");
+  assert.equal(kimi.model, "k3");
+  assert.equal(kimi.url, "https://api.kimi.com/coding/v1/responses");
+  assert.equal(kimi.token, "kimi-token");
+});
+
 test("upstreamTargetFor routes zen free models to the zen/v1 responses endpoint", () => {
   const config = configStub();
   const free = upstreamTargetFor(config, "deepseek-v4-flash-free");
@@ -714,6 +737,110 @@ test("routeGatewayRequest escalates current-turn images to the vision model", ()
   assert.equal(route.model, "gpt-5.6-luna");
   assert.equal(route.directVision, true);
   assert.equal(route.reason, "current_turn_image");
+});
+
+test("applyToolPolicy keeps view_image for a model that can see", () => {
+  // view_image shows the human a local image file. It is hidden from the
+  // text-only models because they cannot interpret what they open, but a
+  // vision-capable model has a real use for it.
+  const tools = [{ type: "function", name: "view_image" }, { type: "function", name: "shell_command" }];
+
+  const blind = applyToolPolicy(tools);
+  assert.deepEqual(blind.tools.map((t) => t.name), ["shell_command"]);
+  assert.equal(blind.stripped.hidden, 1);
+
+  const sighted = applyToolPolicy(tools, { hiddenToolNames: new Set() });
+  assert.deepEqual(sighted.tools.map((t) => t.name), ["view_image", "shell_command"]);
+  assert.equal(sighted.stripped.hidden, 0);
+});
+
+test("hiddenToolsFor drops view_image only from models that cannot see", () => {
+  assert.ok(hiddenToolsFor(false).has("view_image"), "a blind model keeps view_image hidden");
+  assert.equal(hiddenToolsFor(true).has("view_image"), false, "a seeing model keeps the tool");
+});
+
+test("adaptImageUrlShape sends each model the image_url shape it accepts", () => {
+  // Measured 2026-08-17 on opencode.ai/zen/go/v1/responses with the same PNG:
+  //   mimo-v2.5      image_url as a bare string -> 400 `image_url is invalid`
+  //                  image_url as { url }       -> 200 "HELLO VISION 42"
+  //   gpt-5.6-luna   as a bare string           -> 200
+  //                  as { url }                 -> 400 invalid_prompt
+  //   kimi-k2.7-code accepts both.
+  // The Responses spec says string, so string stays the default and only a model
+  // that demands otherwise carries imageUrlShape on its catalog entry.
+  const input = [
+    { type: "message", role: "user", content: [
+      { type: "input_text", text: "color?" },
+      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+    ] },
+  ];
+
+  const asString = adaptImageUrlShape(input, "string");
+  assert.equal(asString[0].content[1].image_url, "data:image/png;base64,AAAA");
+  assert.equal(asString, input, "the default shape is returned untouched");
+
+  const asObject = adaptImageUrlShape(input, "object");
+  assert.deepEqual(asObject[0].content[1].image_url, { url: "data:image/png;base64,AAAA" });
+  assert.equal(asObject[0].content[0].text, "color?", "text parts are untouched");
+  assert.equal(input[0].content[1].image_url, "data:image/png;base64,AAAA", "the caller's input is not mutated");
+});
+
+test("rewriteHistoricalImages keeps the current image for a model that can see", () => {
+  // Current-turn images used to be preserved only on the escalation path
+  // (directVision). Once a vision-capable model keeps its own turn, that flag is
+  // false for it - and stripping the image is precisely the wrong move, because
+  // that model is the one that can actually read it.
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }] },
+  ];
+  const kept = rewriteHistoricalImages(input, null, { preserveCurrentImages: true });
+  assert.equal(kept[0].content[0].type, "input_image", "the current turn keeps its real image part");
+});
+
+test("routeGatewayRequest does not escalate to an empty vision model", () => {
+  // Vision can be set to None (MODELDOCK_VISION_MODEL=none, or no provider owns a
+  // vision model yet). Escalating anyway produced model:"" which providerForModel
+  // resolves to the ACTIVE PROFILE - so an image sent to any model silently hit
+  // the dashboard provider's endpoint with an empty model id, and its error was
+  // reported under that provider's name.
+  const source = {
+    model: "glm-5.3@zai",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_image", image_url: "https://example.com/x.png" }] },
+    ],
+  };
+  const route = routeGatewayRequest(source, {
+    mainModel: "deepseek-v4-flash@deepseek-official",
+    visionModel: "",
+    affinity: new RouteAffinity(),
+    knownModels: new Set(["deepseek-v4-flash@deepseek-official", "glm-5.3@zai"]),
+    modelSeesImages: () => false,
+  });
+  assert.notEqual(route.model, "", "an empty vision model must never become the route");
+  assert.equal(route.model, "glm-5.3@zai", "the turn stays with the model the client asked for");
+});
+
+test("routeGatewayRequest leaves an image with a model that can see it", () => {
+  // Escalation exists because the DeepSeek family is blind. A model that can
+  // actually see must keep its own turn: hijacking it to the vision model costs
+  // an extra upstream call, spends the vision model's quota, and drops the image
+  // out of the conversation the user actually selected.
+  const source = {
+    model: "k3@kimi",
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_image", image_url: "https://example.com/x.png" }] },
+    ],
+  };
+  const route = routeGatewayRequest(source, {
+    mainModel: "deepseek-v4-flash",
+    visionModel: "kimi-k2.7-code@opencode-go",
+    affinity: new RouteAffinity(),
+    knownModels: new Set(["deepseek-v4-flash", "kimi-k2.7-code@opencode-go", "k3@kimi"]),
+    modelSeesImages: (model) => model === "k3@kimi",
+  });
+  assert.equal(route.model, "k3@kimi", "the vision-capable model keeps its own image turn");
+  assert.equal(route.directVision, false);
+  assert.equal(route.reason, "client_selected");
 });
 
 test("routeGatewayRequest lets an explicit client model reclaim a stale vision pin", () => {
@@ -1075,6 +1202,115 @@ test("relayResponses forwards a streamed response and records usage", async () =
     assert.equal(finished.outputTokens, 2, "finish must carry output tokens onto the trace record");
     assert.equal(usageEvents[0].cachedTokens, 3, "usage event must carry cached tokens from the upstream details");
     assert.equal(usageEvents[0].reasoningTokens, 1, "usage event must carry reasoning tokens from the upstream details");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("relayResponses drops reasoning for a model with no effort control", async () => {
+  // Twelve of the published models expose only a thinking on/off toggle, or
+  // nothing at all - the strings low/high/xhigh appear nowhere in their vendors'
+  // docs. They carry one cosmetic rung so Codex has something to show, but the
+  // parameter itself must not be forwarded: at best the upstream ignores it, at
+  // worst it 400s.
+  const metrics = { begin: () => () => {}, recordResponseTransform: () => {}, recordResponseUsage: () => {} };
+  const bodies = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from('event: response.completed\ndata: {"type":"response.completed","response":{"model":"x","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  };
+  const send = (model) => relayResponses(
+    { model, reasoning: { effort: "high" }, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }] },
+    responseStub(collectStream()),
+    {
+      recordUsage: () => {},
+      config: configStub(),
+      metrics,
+      routeAffinity: new RouteAffinity(),
+      knownModels: new Set(["deepseek-v4-flash", "gpt-5.6-luna", "kimi-k2.7-code@opencode-go"]),
+      mainModel: "deepseek-v4-flash",
+      visionModel: "gpt-5.6-luna",
+    },
+  );
+  try {
+    await send("kimi-k2.7-code@opencode-go");
+    assert.equal(bodies[0].reasoning, undefined, "a model with no effort control gets no reasoning field");
+
+    bodies.length = 0;
+    await send("deepseek-v4-flash");
+    assert.deepEqual(bodies[0].reasoning, { effort: "high" }, "a model with a real ladder keeps it");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("relayResponses keeps the real image for a vision-capable model it routes to", async () => {
+  // The escalation path preserved current-turn images, but a vision-capable
+  // model that keeps its OWN turn takes reason "client_selected" with
+  // directVision false - and rewriteHistoricalImages then replaced its image
+  // with an image_ref placeholder whose text orders the model to call
+  // vision_inspect. Measured symptom: Kimi k3 reads the PNG correctly when
+  // called directly, and answers "I don't have the image contents available in
+  // this turn" through the gateway.
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const metrics = {
+    begin: () => () => {},
+    recordResponseTransform: () => {},
+    recordResponseUsage: () => {},
+  };
+  const bodies = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    bodies.push(JSON.parse(options.body));
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from('event: response.completed\ndata: {"type":"response.completed","response":{"model":"kimi-k2.7-code","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+  };
+  try {
+    await relayResponses(
+      {
+        model: "kimi-k2.7-code@opencode-go",
+        input: [{ type: "message", role: "user", content: [
+          { type: "input_text", text: "Transcribe the text exactly." },
+          { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+        ] }],
+      },
+      res,
+      {
+        recordUsage: () => {},
+        config: configStub(),
+        metrics,
+        routeAffinity: new RouteAffinity(),
+        knownModels: new Set(["deepseek-v4-flash", "gpt-5.6-luna", "kimi-k2.7-code@opencode-go"]),
+        mainModel: "deepseek-v4-flash",
+        visionModel: "gpt-5.6-luna",
+      },
+    );
+    const parts = bodies[0].input[0].content;
+    assert.ok(
+      parts.some((part) => part.type === "input_image"),
+      "the model that can read the image must actually receive it",
+    );
+    assert.ok(
+      !parts.some((part) => typeof part.text === "string" && part.text.includes("vision_inspect")),
+      "no image_ref placeholder is substituted for a model that can see",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

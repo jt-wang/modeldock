@@ -5,11 +5,16 @@
 // the entire context problem to the gate. At 250k it manages the session itself and
 // md_memory becomes a safety net rather than the only mechanism.
 // Configurable so the figure can be corrected without a release.
-const CONTEXT_WINDOW = Number(process.env.MODELDOCK_CONTEXT_WINDOW || 250_000);
+// Read lazily, not once at import: config.mjs imports this module before it
+// merges the .env file into process.env, so a module-level const captured the
+// 250k default and the documented MODELDOCK_CONTEXT_WINDOW line in .env never
+// reached the catalog - only a shell-exported value did.
+function contextWindowDefault() {
+  return Number(process.env.MODELDOCK_CONTEXT_WINDOW || 250_000);
+}
 const AUTO_COMPACT_PERCENT = 0.8;
-const AUTO_COMPACT_TOKEN_LIMIT = Math.floor(CONTEXT_WINDOW * AUTO_COMPACT_PERCENT);
 
-export { CONTEXT_WINDOW, AUTO_COMPACT_PERCENT, AUTO_COMPACT_TOKEN_LIMIT };
+export { contextWindowDefault, AUTO_COMPACT_PERCENT };
 
 // The fixed model pair the Trial mode runs on. Both live in the opencode-go profile
 // (zen free endpoint, same OpenCode token); Trial is a mode over that profile, not a
@@ -17,14 +22,30 @@ export { CONTEXT_WINDOW, AUTO_COMPACT_PERCENT, AUTO_COMPACT_TOKEN_LIMIT };
 export const TRIAL_MAIN_MODEL = "deepseek-v4-flash-free";
 export const TRIAL_VISION_MODEL = "mimo-v2.5-free";
 
-const DEEPSEEK_REASONING_LEVELS = [
-  { effort: "none", description: "No reasoning; direct responses only" },
-  { effort: "minimal", description: "Barely any reasoning; fastest replies" },
-  { effort: "low", description: "Fast responses with lighter reasoning" },
-  { effort: "medium", description: "Balanced reasoning for typical work" },
-  { effort: "high", description: "Deeper reasoning for complex work" },
-  { effort: "xhigh", description: "Extra-deep reasoning for hard problems" },
-];
+// One description per effort, so a model's ladder is expressed as a list of
+// effort names rather than a hand-written array per provider.
+const REASONING_DESCRIPTIONS = {
+  none: "No reasoning; direct responses only",
+  minimal: "Barely any reasoning; fastest replies",
+  low: "Fast responses with lighter reasoning",
+  medium: "Balanced reasoning for typical work",
+  high: "Deeper reasoning for complex work",
+  xhigh: "Extra-deep reasoning for hard problems",
+  max: "Maximum reasoning depth",
+};
+
+// The ladder a model actually accepts. Which efforts an upstream honours is a
+// property of the MODEL, not of the camp it is sold through - GLM-5.3 rejects
+// xhigh while GLM-5.2 on the same endpoint takes all seven - so entries in
+// availableModels may carry reasoningEfforts / defaultReasoningEffort and the
+// profile-level values are only the fallback.
+export function reasoningLadder(efforts) {
+  return efforts
+    .filter((effort) => REASONING_DESCRIPTIONS[effort])
+    .map((effort) => ({ effort, description: REASONING_DESCRIPTIONS[effort] }));
+}
+
+const DEEPSEEK_REASONING_LEVELS = reasoningLadder(["low", "high", "max"]);
 
 // Feature flags Codex reads from the model catalog to decide which client-side plugin
 // machinery to expose (verified in the Codex binary's ModelInfo vocabulary):
@@ -37,7 +58,7 @@ export const EXPERIMENTAL_SUPPORTED_TOOLS = ["artifact", "tool_call_mcp_elicitat
 // One catalog entry. Codex's model picker lists whatever the active provider returns
 // from /v1/models, so emitting an entry per available model is what makes them all
 // selectable at runtime - no config rewrite, no restart.
-function catalogEntry({ slug, displayName, description, compHash, inputModalities, supportsSearchTool, baseInstructions, defaultReasoningLevel, supportedReasoningLevels, priority, contextWindow = CONTEXT_WINDOW }) {
+function catalogEntry({ slug, displayName, description, compHash, inputModalities, supportsSearchTool, baseInstructions, defaultReasoningLevel, supportedReasoningLevels, priority, contextWindow = contextWindowDefault() }) {
   const autoCompactTokenLimit = Math.floor(contextWindow * AUTO_COMPACT_PERCENT);
   return {
         slug,
@@ -93,7 +114,35 @@ function modelCatalogDefaults({ profileId, mainModel, displayName, description, 
   // The main entry is owner-qualified like every other published entry, even when
   // the caller passed a bare reference (a legacy .env or a test fixture).
   const qualifiedMain = publishedSlugFor(profileId, mainModel);
-  const base = { compHash, supportsSearchTool, baseInstructions, defaultReasoningLevel, supportedReasoningLevels };
+  // Instructions are resolved per model: baseInstructions may be a function so a
+  // model that can actually see is never handed the text-only vision paragraph.
+  // A plain string still works for older callers and tests.
+  const instructionsFor = typeof baseInstructions === "function"
+    ? (supportsVision) => baseInstructions({ supportsVision: Boolean(supportsVision) })
+    : () => baseInstructions;
+  const visionOf = (id) => Boolean(
+    (profileById(providerForModel({ profileId }, id)).availableModels || [])
+      .find((entry) => entry.id === bareModelId(id))?.supportsVision,
+  );
+  const base = { compHash, supportsSearchTool };
+  // Same per-model resolution as visionOf/contextWindowFor: look the entry up in
+  // its OWNING provider so a main model from another camp keeps its own ladder.
+  const entryFor = (id) => (profileById(providerForModel({ profileId }, id)).availableModels || [])
+    .find((entry) => entry.id === bareModelId(id));
+  // Fall back to the OWNING profile's ladder, not the active one: DeepSeek
+  // Official ships a six-rung ladder defaulting to medium, and its models must
+  // keep it when they appear inside another camp's catalog.
+  const reasoningFor = (id, entry) => {
+    const owner = profileById(providerForModel({ profileId }, id));
+    return {
+      defaultReasoningLevel: entry?.defaultReasoningEffort
+        || owner?.defaultReasoningLevel
+        || defaultReasoningLevel,
+      supportedReasoningLevels: entry?.reasoningEfforts
+        ? reasoningLadder(entry.reasoningEfforts)
+        : (owner?.supportedReasoningLevels || supportedReasoningLevels),
+    };
+  };
   // The selected main model may belong to a provider other than the active
   // profile (e.g. a dashboard-added custom endpoint set as main). Label its
   // catalog entry "Provider - Model" like every other entry; the caller's
@@ -109,7 +158,17 @@ function modelCatalogDefaults({ profileId, mainModel, displayName, description, 
   };
   // The main model may be the published slug (gpt-5.6-luna@opencode-go); the profile
   // catalog stores bare ids, so resolve through bareModelId before looking it up.
-  const contextWindowFor = (id) => availableModels.find((model) => model.id === bareModelId(id))?.contextWindow || CONTEXT_WINDOW;
+  // Resolve against the OWNING provider, not the active profile: the selected
+  // main model routinely belongs to another camp now (a zai or kimi main under an
+  // opencode-go profile). Searching only the local list missed and fell back to
+  // the 250k default, under-declaring a 1M window by 4x and quartering the
+  // auto-compact limit with it. Same lookup shape as visionOf above.
+  const contextWindowFor = (id) => (
+    (profileById(providerForModel({ profileId }, id)).availableModels || [])
+      .find((model) => model.id === bareModelId(id))?.contextWindow
+    || availableModels.find((model) => model.id === bareModelId(id))?.contextWindow
+    || contextWindowDefault()
+  );
   // Every provider's models in one list, each labelled with its source, so the picker
   // can switch upstream as well as model. The bare id stays with the default profile so
   // existing Codex configs keep resolving; another provider's copy of the same id is
@@ -126,15 +185,17 @@ function modelCatalogDefaults({ profileId, mainModel, displayName, description, 
         displayName: `${entry.label} - ${model.label || model.id}`,
         supportsVision: Boolean(model.supportsVision),
         providerLabel: entry.label,
-        contextWindow: model.contextWindow || CONTEXT_WINDOW,
+        contextWindow: model.contextWindow || contextWindowDefault(),
       });
     }
   }
   return {
     models: [
-      catalogEntry({ ...base, slug: qualifiedMain, displayName: ownerQualifiedDisplayName(qualifiedMain) || displayName, description, inputModalities, priority: 1, contextWindow: contextWindowFor(qualifiedMain) }),
+      catalogEntry({ ...base, ...reasoningFor(qualifiedMain, entryFor(qualifiedMain)), baseInstructions: instructionsFor(visionOf(qualifiedMain)), slug: qualifiedMain, displayName: ownerQualifiedDisplayName(qualifiedMain) || displayName, description, inputModalities, priority: 1, contextWindow: contextWindowFor(qualifiedMain) }),
       ...rest.map((model, index) => catalogEntry({
         ...base,
+        ...reasoningFor(model.slug, entryFor(model.slug)),
+        baseInstructions: instructionsFor(model.supportsVision),
         slug: model.slug,
         displayName: model.displayName,
         description: `${model.providerLabel} through the local ModelDock gate.`,
@@ -157,32 +218,36 @@ const OPENCODE_GO_PROFILE = {
 
   blockedToolTypes: new Set(["tool_search", "web_search"]),
   availableModels: [
-    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", endpoint: "responses", supportsVision: false, contextWindow: 400_000, status: "available" },
+    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high", supportsVision: false, contextWindow: 400_000, status: "available" },
     // Zen free tier: same OpenCode token, but the upstream is zen/v1 not zen/go/v1.
     // deepseek-v4-flash-free is available but frequently returns 503 when the free
     // quota is exhausted; the upstream surfaces it per request.
-    { id: "deepseek-v4-flash-free", label: "DeepSeek V4 Flash Free", endpoint: "responses", zen: true, free: true, supportsVision: false, quota5h: 100000, status: "available" },
-    { id: "nemotron-3-ultra-free", label: "Nemotron 3 Ultra Free", endpoint: "responses", zen: true, free: true, supportsVision: false, status: "available" },
-    { id: "laguna-s-2.1-free", label: "Laguna S 2.1 Free", endpoint: "responses", zen: true, free: true, supportsVision: false, status: "available" },
-    { id: "longcat-2.0-free", label: "Longcat 2.0 Free", endpoint: "responses", zen: true, free: true, supportsVision: false, status: "available" },
-    { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", endpoint: "responses", supportsVision: false, contextWindow: 400_000, status: "available" },
-    { id: "glm-5", label: "GLM 5", endpoint: "responses", supportsVision: false, status: "available" },
-    { id: "glm-5.1", label: "GLM 5.1", endpoint: "responses", supportsVision: false, status: "available" },
-    { id: "glm-5.2", label: "GLM 5.2", endpoint: "responses", supportsVision: false, status: "available" },
+    { id: "deepseek-v4-flash-free", label: "DeepSeek V4 Flash Free", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high", zen: true, free: true, supportsVision: false, quota5h: 100000, status: "available" },
+    { id: "nemotron-3-ultra-free", label: "Nemotron 3 Ultra Free", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, zen: true, free: true, supportsVision: false, status: "available" },
+    { id: "laguna-s-2.1-free", label: "Laguna S 2.1 Free", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, zen: true, free: true, supportsVision: false, status: "available" },
+    { id: "longcat-2.0-free", label: "Longcat 2.0 Free", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, zen: true, free: true, supportsVision: false, status: "available" },
+    { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high", supportsVision: false, contextWindow: 400_000, status: "available" },
+    { id: "glm-5", label: "GLM 5", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: false, status: "available" },
+    { id: "glm-5.1", label: "GLM 5.1", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: false, status: "available" },
+    { id: "glm-5.2", label: "GLM 5.2", endpoint: "responses", reasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "max", supportsVision: false, status: "available" },
     // The bare id gpt-5.6-luna is also a native GPT picker slot, so our Luna is
     // published under the @opencode-go suffix and the bare id stays reserved for
     // the native backend's GPT-5.6-Luna.
-    { id: "gpt-5.6-luna", label: "Luna", endpoint: "responses", supportsVision: true, visionScore: 7, visionMaxScore: 9, visionTier: "medium", quota5h: 2050, speedTier: "fast", ownerQualified: true, status: "available" },
-    { id: "grok-4.5", label: "Grok 4.5", endpoint: "responses", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 120, speedTier: "fast", status: "available" },
-    { id: "hy3", label: "Hy3", endpoint: "responses", supportsVision: false, status: "available" },
+    { id: "gpt-5.6-luna", label: "Luna", endpoint: "responses", reasoningEfforts: ["none", "low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "medium", supportsVision: true, visionScore: 7, visionMaxScore: 9, visionTier: "medium", quota5h: 2050, speedTier: "fast", ownerQualified: true, status: "available" },
+    { id: "grok-4.5", label: "Grok 4.5", endpoint: "responses", reasoningEfforts: ["low", "medium", "high"], defaultReasoningEffort: "high", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 120, speedTier: "fast", status: "available" },
+    { id: "hy3", label: "Hy3", endpoint: "responses", reasoningEfforts: ["low", "high"], defaultReasoningEffort: "low", supportsVision: false, status: "available" },
     { id: "hy3-preview", label: "Hy3 Preview", endpoint: "responses", supportsVision: false, status: "unavailable" },
-    { id: "kimi-k2.5", label: "Kimi K2.5", endpoint: "responses", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 1150, speedTier: "fast", status: "available" },
-    { id: "kimi-k2.6", label: "Kimi K2.6", endpoint: "responses", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 1150, speedTier: "fast", status: "available" },
-    { id: "kimi-k2.7-code", label: "Kimi K2.7 Code", endpoint: "responses", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 1350, speedTier: "fast", status: "available" },
-    { id: "kimi-k3", label: "Kimi K3", endpoint: "responses", supportsVision: false, status: "available" },
-    { id: "mimo-v2.5", label: "MiMo V2.5", endpoint: "responses", supportsVision: true, visionScore: 6, visionMaxScore: 9, visionTier: "medium", quota5h: 30100, speedTier: "medium", status: "available" },
-    { id: "mimo-v2.5-free", label: "MiMo V2.5 Free", endpoint: "responses", zen: true, supportsVision: true, visionScore: 6, visionMaxScore: 9, visionTier: "medium", quota5h: 100000, speedTier: "fast", free: true, status: "available" },
-    { id: "mimo-v2.5-pro", label: "MiMo V2.5 Pro", endpoint: "responses", supportsVision: false, status: "available" },
+    { id: "kimi-k2.5", label: "Kimi K2.5", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 1150, speedTier: "fast", status: "available" },
+    { id: "kimi-k2.6", label: "Kimi K2.6", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 1150, speedTier: "fast", status: "available" },
+    { id: "kimi-k2.7-code", label: "Kimi K2.7 Code", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 1350, speedTier: "fast", status: "available" },
+    { id: "kimi-k3", label: "Kimi K3", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "max", supportsVision: false, status: "available" },
+    // imageUrlShape: measured 2026-08-17 against zen/go/v1/responses with the
+    // same PNG - a bare-string image_url returns 400 `image_url is invalid`,
+    // the chat-style { url } object returns 200. gpt-5.6-luna is the exact
+    // opposite (string 200, object 400), so this cannot be a global choice.
+    { id: "mimo-v2.5", label: "MiMo V2.5", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, imageUrlShape: "object", supportsVision: true, visionScore: 6, visionMaxScore: 9, visionTier: "medium", quota5h: 30100, speedTier: "medium", status: "available" },
+    { id: "mimo-v2.5-free", label: "MiMo V2.5 Free", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, zen: true, supportsVision: true, visionScore: 6, visionMaxScore: 9, visionTier: "medium", quota5h: 100000, speedTier: "fast", free: true, status: "available" },
+    { id: "mimo-v2.5-pro", label: "MiMo V2.5 Pro", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: false, status: "available" },
     { id: "mimo-v2-omni", label: "MiMo V2 Omni", endpoint: "responses", supportsVision: false, status: "unavailable" },
     { id: "mimo-v2-pro", label: "MiMo V2 Pro", endpoint: "responses", supportsVision: false, status: "unavailable" },
     // Chat-completions dialect is not supported by the passthrough gateway yet.
@@ -190,9 +255,9 @@ const OPENCODE_GO_PROFILE = {
     // that would 400. Note several of them are vision-capable (minimax-m3, qwen3.5/
     // 3.6/3.7-plus, qwen3.8-max); they become candidates for the vision picker
     // once a chat adapter exists.
-    { id: "minimax-m2.5", label: "MiniMax M2.5", endpoint: "chat", supportsVision: false, status: "unavailable" },
-    { id: "minimax-m2.7", label: "MiniMax M2.7", endpoint: "responses", supportsVision: false, status: "available" },
-    { id: "minimax-m3", label: "MiniMax M3", endpoint: "chat", supportsVision: true, visionScore: 8, visionMaxScore: 9, visionTier: "strong", quota5h: 3200, speedTier: "fast", status: "unavailable" },
+    { id: "minimax-m2.5", label: "MiniMax M2.5", endpoint: "chat", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: false, status: "unavailable" },
+    { id: "minimax-m2.7", label: "MiniMax M2.7", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: false, status: "available" },
+    { id: "minimax-m3", label: "MiniMax M3", endpoint: "chat", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: true, visionScore: 8, visionMaxScore: 9, visionTier: "strong", quota5h: 3200, speedTier: "fast", status: "unavailable" },
     { id: "qwen3.5-plus", label: "Qwen 3.5 Plus", endpoint: "chat", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 3300, speedTier: "medium", status: "unavailable" },
     { id: "qwen3.6-plus", label: "Qwen 3.6 Plus", endpoint: "chat", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", quota5h: 3300, speedTier: "slow", status: "unavailable" },
     { id: "qwen3.7-max", label: "Qwen 3.7 Max", endpoint: "chat", supportsVision: false, status: "unavailable" },
@@ -222,6 +287,13 @@ const OPENCODE_GO_PROFILE = {
 const DEEPSEEK_OFFICIAL_PROFILE = {
   id: "deepseek-official",
   label: "DeepSeek Official",
+  // Declared on the profile so the ladder travels with the models when another
+  // camp's catalog lists them. DeepSeek documents three rungs (low/high/max)
+  // defaulting to high; none/minimal/medium/xhigh are compatibility aliases on
+  // the Responses wire that all collapse onto low or high, so publishing them
+  // would add picker entries that change nothing.
+  defaultReasoningLevel: "high",
+  supportedReasoningLevels: DEEPSEEK_REASONING_LEVELS,
   baseUrl: "https://api.deepseek.com",
   tokenEnvName: "DEEPSEEK_API_KEY",
 
@@ -239,8 +311,8 @@ const DEEPSEEK_OFFICIAL_PROFILE = {
   // Hosted web_search is native too (echoed in the response tools list); tool_search is
   // silently ignored. So the same allowlist as opencode-go works, and nothing is blocked.
   availableModels: [
-    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", endpoint: "responses", supportsVision: false, contextWindow: 400_000, status: "available" },
-    { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", endpoint: "responses", supportsVision: false, contextWindow: 400_000, status: "available" },
+    { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high", supportsVision: false, contextWindow: 400_000, status: "available" },
+    { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high", supportsVision: false, contextWindow: 400_000, status: "available" },
   ],
 
   modelCatalog({ mainModel, baseInstructions }) {
@@ -255,10 +327,76 @@ const DEEPSEEK_OFFICIAL_PROFILE = {
       // Verified live (2026-08-04): the official API accepts reasoning effort in
       // { none, minimal, low, medium, high, xhigh, max } with thinking on by default
       // (effort null). The Go camp's low/high/max triple does not fit it.
-      defaultReasoningLevel: "medium",
+      defaultReasoningLevel: "high",
       supportedReasoningLevels: DEEPSEEK_REASONING_LEVELS,
       availableModels: DEEPSEEK_OFFICIAL_PROFILE.availableModels,
       baseInstructions,
+    });
+  },
+};
+
+// Z.AI's coding plan. Speaks the Responses wire natively at /api/v1, so it needs
+// no dialect translation - it is an ordinary profile like the two above.
+// GLM-5.3 was measured (2026-08-17) against assets/vision/t1-red.png and
+// t3-ocr.png: it accepted the input_image part but replied "I don't see an image
+// in your message", so every model here is text-only and visual turns must keep
+// escalating to a vision-capable model on another provider.
+const ZAI_PROFILE = {
+  id: "zai",
+  label: "Z.AI GLM",
+  baseUrl: "https://api.z.ai/api/v1",
+  tokenEnvName: "ZAI_API_KEY",
+
+  blockedToolTypes: new Set([]),
+  hiddenToolNames: new Set(["view_image"]),
+  availableModels: [
+    { id: "glm-5.3", label: "GLM 5.3", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "max", supportsVision: false, contextWindow: 1_000_000, status: "available" },
+    { id: "glm-5.2", label: "GLM 5.2", endpoint: "responses", reasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"], defaultReasoningEffort: "max", supportsVision: false, contextWindow: 1_000_000, status: "available" },
+    { id: "glm-5-turbo", label: "GLM 5 Turbo", endpoint: "responses", reasoningEfforts: ["high"], defaultReasoningEffort: "high", reasoningEffortSupported: false, supportsVision: false, contextWindow: 200_000, status: "available" },
+  ],
+
+  modelCatalog({ mainModel, baseInstructions }) {
+    return modelCatalogDefaults({
+      profileId: ZAI_PROFILE.id,
+      mainModel,
+      displayName: "Z.AI GLM",
+      description: "Z.AI coding plan through the local ModelDock gate.",
+      compHash: "modeldock-zai-v1",
+      inputModalities: ["text"],
+      supportsSearchTool: false,
+      baseInstructions,
+      availableModels: ZAI_PROFILE.availableModels,
+    });
+  },
+};
+
+// Moonshot's Kimi coding plan. Also native Responses, at /coding/v1.
+// k3 was measured (2026-08-17) on the same two fixtures and answered "Red" and
+// "HELLO VISION 42" correctly, so it is genuinely vision-capable and must NOT be
+// told it is text-only - see baseInstructionsFor's perModel handling.
+const KIMI_PROFILE = {
+  id: "kimi",
+  label: "Kimi Code",
+  baseUrl: "https://api.kimi.com/coding/v1",
+  tokenEnvName: "KIMI_API_KEY",
+
+  blockedToolTypes: new Set([]),
+  hiddenToolNames: new Set([]),
+  availableModels: [
+    { id: "k3", label: "Kimi K3", endpoint: "responses", reasoningEfforts: ["low", "high", "max"], defaultReasoningEffort: "high", supportsVision: true, visionScore: 9, visionMaxScore: 9, visionTier: "strong", contextWindow: 256_000, status: "available" },
+  ],
+
+  modelCatalog({ mainModel, baseInstructions }) {
+    return modelCatalogDefaults({
+      profileId: KIMI_PROFILE.id,
+      mainModel,
+      displayName: "Kimi Code",
+      description: "Kimi coding plan through the local ModelDock gate.",
+      compHash: "modeldock-kimi-v1",
+      inputModalities: ["text", "image"],
+      supportsSearchTool: false,
+      baseInstructions,
+      availableModels: KIMI_PROFILE.availableModels,
     });
   },
 };
@@ -293,6 +431,8 @@ const CUSTOM_PROFILE = {
 const PROFILES = {
   "opencode-go": OPENCODE_GO_PROFILE,
   "deepseek-official": DEEPSEEK_OFFICIAL_PROFILE,
+  zai: ZAI_PROFILE,
+  kimi: KIMI_PROFILE,
   custom: CUSTOM_PROFILE,
 };
 
@@ -395,4 +535,4 @@ export function tokenFor(config, model) {
   return config?.tokens?.[provider] || "";
 }
 
-export { OPENCODE_GO_PROFILE, DEEPSEEK_OFFICIAL_PROFILE };
+export { OPENCODE_GO_PROFILE, DEEPSEEK_OFFICIAL_PROFILE, ZAI_PROFILE, KIMI_PROFILE };

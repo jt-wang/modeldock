@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { bareModelId, modelEntryFor, providerForModel } from "./profiles.mjs";
+import { bareModelId, modelEntryFor, profileById, providerForModel } from "./profiles.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import { translateUpstreamError, freeEmptyOutputError } from "./error-translation.mjs";
 import { RouteAffinity, routeResponsesRequest, isAssistantMarker } from "./router.mjs";
@@ -23,6 +23,14 @@ const HOSTED_TOOL_TYPES = new Set([
 // Tools that hand the model bytes it cannot interpret (text-only main models).
 // The vision path is vision_inspect or direct image escalation, not view_image.
 const TEXT_MODEL_HIDDEN_TOOLS = new Set(["view_image"]);
+const SIGHTED_MODEL_HIDDEN_TOOLS = new Set();
+
+// view_image opens a local image file for the human. A text-only model cannot
+// interpret what it opened, so the tool is hidden from it and vision_inspect is
+// the path instead; a model that can see has a real use for it and keeps it.
+export function hiddenToolsFor(supportsVision) {
+  return supportsVision ? SIGHTED_MODEL_HIDDEN_TOOLS : TEXT_MODEL_HIDDEN_TOOLS;
+}
 
 function redactBearer(value) {
   return String(value || "")
@@ -756,6 +764,29 @@ export function rewriteHistoricalImages(input, mediaStore, { preserveCurrentImag
   });
 }
 
+// Providers disagree about the shape of `image_url` on the Responses wire. The
+// spec says a bare string, and most models take it - but some reject it and want
+// the chat-style { url } object instead, so the shape is per-model data
+// (imageUrlShape on the catalog entry) rather than something the gateway can
+// assume. Returns the input untouched for the default shape.
+export function adaptImageUrlShape(input, shape) {
+  if (shape !== "object" || !Array.isArray(input)) return input;
+  let changed = false;
+  const out = input.map((item) => {
+    if (!item || typeof item !== "object" || !Array.isArray(item.content)) return item;
+    let itemChanged = false;
+    const content = item.content.map((part) => {
+      if (!part || part.type !== "input_image" || typeof part.image_url !== "string") return part;
+      itemChanged = true;
+      return { ...part, image_url: { url: part.image_url } };
+    });
+    if (!itemChanged) return item;
+    changed = true;
+    return { ...item, content };
+  });
+  return changed ? out : input;
+}
+
 // Tool policy: keep standard function/custom tools, flatten MCP namespaces so
 // text models see plain functions, and strip hosted schemas plus tools the model
 // cannot use. Returns the filtered list and a report of what was removed.
@@ -812,12 +843,20 @@ export function upstreamTargetFor(config, model) {
       token: config.tokens?.["custom"] || config.customApiKey || "",
     };
   }
-  if (provider === "deepseek-official") {
+  // OpenCode Go is the one profile whose base URL is not a single constant: its
+  // free tier lives on zen/v1 while the paid models are on zen/go/v1.
+  if (provider !== "opencode-go") {
+    // Every other registered profile carries its own base URL, so routing reads
+    // the registry instead of growing a branch per provider.
+    const profile = profileById(provider);
+    const override = provider === "deepseek-official" ? config.deepseekBaseUrl : "";
     return {
       provider,
       model: upstreamModel,
-      url: `${(config.deepseekBaseUrl || "https://api.deepseek.com").replace(/\/+$/, "")}/responses`,
-      token: config.tokens?.["deepseek-official"] || config.deepseekToken || "",
+      url: `${String(override || profile?.baseUrl || "").replace(/\/+$/, "")}/responses`,
+      token: config.tokens?.[provider]
+        || (provider === "deepseek-official" ? config.deepseekToken : "")
+        || "",
     };
   }
   const entry = modelEntryFor(config, upstreamModel);
@@ -835,8 +874,8 @@ export function upstreamTargetFor(config, model) {
   };
 }
 
-export function routeGatewayRequest(source, { mainModel, visionModel, affinity, knownModels }) {
-  return routeResponsesRequest(source, { mainModel, visionModel, affinity, knownModels });
+export function routeGatewayRequest(source, { mainModel, visionModel, affinity, knownModels, modelSeesImages }) {
+  return routeResponsesRequest(source, { mainModel, visionModel, affinity, knownModels, modelSeesImages });
 }
 
 export { RouteAffinity };
@@ -1856,6 +1895,7 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     visionModel,
     affinity: routeAffinity,
     knownModels,
+    modelSeesImages: (model) => Boolean(modelEntryFor(config, model)?.supportsVision),
   });
   const summarizeBody = {
     ...payload,
@@ -1865,7 +1905,12 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     tool_choice: "none",
     input: [
       ...rewriteHistoricalImages(normalizeGatewayInput(payload.input), mediaStore, {
-        preserveCurrentImages: route.directVision,
+        // Keep the real image whenever the model receiving it can read it:
+        // on the escalation path (directVision), and also when a vision-capable
+        // model keeps its own turn - stripping it there blinds the one model
+        // that did not need help.
+        preserveCurrentImages: route.directVision
+          || Boolean(modelEntryFor(config, route.model)?.supportsVision),
       }),
       messageItem(COMPACT_PROMPT),
     ],
@@ -2117,6 +2162,7 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
     visionModel,
     affinity: routeAffinity,
     knownModels,
+    modelSeesImages: (model) => Boolean(modelEntryFor(config, model)?.supportsVision),
   });
 
   // opencode's pro route needs the reasoning-id and assistant-content rewrites;
@@ -2129,7 +2175,14 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
     input: rewriteHistoricalImages(
       proOpenCodeGo ? normalizeOpenCodeProInput(payload.input) : normalizeGatewayInput(payload.input),
       mediaStore,
-      { preserveCurrentImages: route.directVision },
+      // Same rule as the compaction path: keep the real image whenever the model
+      // receiving it can read it - on the escalation path, and also when a
+      // vision-capable model keeps its own turn. Otherwise the placeholder text
+      // orders it to call vision_inspect for an image it could have just read.
+      {
+        preserveCurrentImages: route.directVision
+          || Boolean(modelEntryFor(config, route.model)?.supportsVision),
+      },
     ),
     model: route.model,
   };
@@ -2144,8 +2197,25 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
   // gate. Re-serializing the parsed payload is the honest post-decode size.
   const bytesIn = Buffer.byteLength(JSON.stringify(payload));
 
-  const { tools, stripped } = applyToolPolicy(normalizedPayload.tools);
+  // The tool list follows the model that will actually receive it, which after
+  // routing may not be the one the client asked for.
+  const { tools, stripped } = applyToolPolicy(normalizedPayload.tools, {
+    hiddenToolNames: hiddenToolsFor(Boolean(modelEntryFor(config, normalizedPayload.model)?.supportsVision)),
+  });
   if (tools !== normalizedPayload.tools) normalizedPayload.tools = tools;
+
+  // Vendors that expose no reasoning_effort at all (only a thinking on/off
+  // toggle, or nothing) publish a single cosmetic rung so Codex has something to
+  // show. Forwarding the parameter to them is at best ignored and at worst a
+  // 400, so it is dropped once routing has settled the target model.
+  if (modelEntryFor(config, normalizedPayload.model)?.reasoningEffortSupported === false) {
+    delete normalizedPayload.reasoning;
+  }
+
+  // Adapt the image parts to the shape this particular upstream accepts, after
+  // routing has settled which model actually receives them.
+  const imageShape = modelEntryFor(config, normalizedPayload.model)?.imageUrlShape;
+  if (imageShape) normalizedPayload.input = adaptImageUrlShape(normalizedPayload.input, imageShape);
 
   const target = upstreamTargetFor(config, normalizedPayload.model);
   // The upstream sees the bare model id; the route model (possibly owner-suffixed)
