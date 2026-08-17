@@ -639,16 +639,21 @@ function renderModelOptions(data) {
   const selectedProvider = models.selectedProvider || "other";
   const visionProviders = models.visionProviders || providers;
   const selectedVisionProvider = models.selectedVisionProvider || "";
-  const providerLabel = providers.find((provider) => provider.id === selectedProvider)?.label || selectedProvider;
-  const mainModelLabel = models.options.find((model) => model.id === selected.mainModel)?.label || selected.mainModel;
-  const providerDisplay = $("main-provider-display");
-  const modelDisplay = $("main-model-display-name");
-  if (providerDisplay) providerDisplay.textContent = providerLabel;
-  if (modelDisplay) modelDisplay.textContent = mainModelLabel;
-  const mainModelStatic = document.querySelector(".model-static");
-  if (mainModelStatic) mainModelStatic.classList.toggle("busy", modelBusy);
-  if (modelDisplay) modelDisplay.classList.toggle("busy", modelBusy);
-  if (providerDisplay) providerDisplay.classList.toggle("busy", modelBusy);
+  const mainProviderSelect = $("main-provider-select");
+  if (mainProviderSelect) {
+    mainProviderSelect.replaceChildren();
+    for (const provider of providers) {
+      const option = document.createElement("option");
+      option.value = provider.id;
+      option.textContent = provider.label;
+      mainProviderSelect.append(option);
+    }
+    mainProviderSelect.value = selectedProvider;
+    mainProviderSelect.disabled = !providers.length || modelBusy || currentMode === "trial" || Boolean(data.config?.trial);
+  }
+  // The main model list follows whichever provider the picker shows, so a
+  // provider switch re-populates it before the selection is posted.
+  const mainFilter = (model) => model.provider === (mainProviderSelect?.value || selectedProvider);
   const visionProviderSelect = $("vision-provider-select");
   if (visionProviderSelect) {
     visionProviderSelect.replaceChildren();
@@ -669,7 +674,10 @@ function renderModelOptions(data) {
     visionProviderSelect.disabled = !visionProviders.length || modelBusy || currentMode === "trial" || Boolean(data.config?.trial);
   }
   const visionFilter = (model) => model.supportsVision && model.provider === (visionProviderSelect?.value || selectedVisionProvider);
-  for (const [id, filter, value, sortBy] of [["vision-model-select", visionFilter, selected.visionModel, "balanceScore"]]) {
+  for (const [id, filter, value, sortBy] of [
+    ["main-model-select", mainFilter, selected.mainModel, null],
+    ["vision-model-select", visionFilter, selected.visionModel, "balanceScore"],
+  ]) {
     const select = $(id);
     if (!select) continue;
     const previous = select.value;
@@ -756,10 +764,20 @@ let autostartEnabled = false;
 
 async function setModels() {
   modelBusy = true;
-  $("vision-model-select").disabled = true;
-  $("vision-provider-select").disabled = true;
+  for (const id of ["main-provider-select", "main-model-select", "vision-provider-select", "vision-model-select"]) {
+    const select = $(id);
+    if (select) select.disabled = true;
+  }
   try {
-    const response = await fetch("/api/models", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ visionModel: $("vision-model-select").value }) });
+    const response = await fetch("/api/models", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        provider: $("main-provider-select")?.value || undefined,
+        mainModel: $("main-model-select")?.value || undefined,
+        visionModel: $("vision-model-select").value,
+      }),
+    });
     const body = await response.json();
     if (!response.ok) throw new Error(body.error?.message || `Model update ${response.status}`);
   } catch (error) {
@@ -1000,6 +1018,17 @@ document.querySelectorAll(".mode-segment").forEach((segment) => {
 
 $("settings-autostart-toggle").addEventListener("change", (event) => {
   setAutostartEnabled(event.target.checked);
+});
+
+$("main-model-select").addEventListener("change", setModels);
+$("main-provider-select").addEventListener("change", () => {
+  // Point the model list at the newly chosen provider before posting, so the
+  // request never carries a model the target provider does not own.
+  const provider = $("main-provider-select").value;
+  const modelSelect = $("main-model-select");
+  const options = Array.from(modelSelect.options).filter((option) => option.dataset.provider === provider);
+  if (options.length) modelSelect.value = options[0].value;
+  setModels();
 });
 
 $("vision-model-select").addEventListener("change", setModels);

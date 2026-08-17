@@ -215,17 +215,19 @@ function onModeSelection(services) {
       && model.id === bareModelId(modelSelection.mainModel)
   ));
   const main = currentMain || models[0];
-  const visionModels = models.filter((model) => model.supportsVision);
-  const currentVision = visionModels.find((model) => (
-    providerForModel(config, modelSelection.visionModel) === providerId
-      && model.id === bareModelId(modelSelection.visionModel)
-  ));
-  const vision = currentVision || visionModels[0] || null;
+  // "One complete route" means every leg has a usable token, not that main and
+  // vision share a provider: the vision picker is deliberately cross-provider.
+  // Keep the current vision model whenever some enabled provider can still serve
+  // it, and fall back to this provider's own vision model only when none can.
+  const servableVision = modelOptions(config, providerId)
+    .find((entry) => entry.id === modelSelection.visionModel && entry.supportsVision);
+  const fallbackVision = models.find((model) => model.supportsVision) || null;
   return {
     providerId,
     profile: profileById(providerId),
     mainModel: publishedSlugFor(providerId, main),
-    visionModel: vision ? publishedSlugFor(providerId, vision) : "",
+    visionModel: servableVision?.id
+      || (fallbackVision ? publishedSlugFor(providerId, fallbackVision) : ""),
   };
 }
 
@@ -1352,7 +1354,12 @@ export function createApp(services = createServices()) {
       config.profileId = nextProvider;
       const profileModels = modelCatalogModels(config, config.profileId);
       if (!profileModels.some((entry) => entry.id === nextMain)) nextMain = profileModels[0]?.id || nextMain;
-      if (!profileModels.some((entry) => entry.id === nextVision && entry.supportsVision)) {
+      // Vision is deliberately cross-provider (the vision picker lists every
+      // enabled provider that owns a vision model), so a main-provider switch
+      // keeps the current pick whenever some enabled provider still offers it.
+      // Only a vision model that no enabled provider can serve falls back to the
+      // newly active profile's own vision model.
+      if (!modelOptions(config, config.profileId).some((entry) => entry.id === nextVision && entry.supportsVision)) {
         nextVision = profileModels.find((entry) => entry.supportsVision)?.id || "";
       }
     }
