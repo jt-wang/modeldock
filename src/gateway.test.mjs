@@ -127,6 +127,19 @@ test("normalizeGatewayInput removes compaction triggers and expands compaction s
   assert.equal(normalized[1].content[0].text, "earlier context");
 });
 
+test("normalizeGatewayInput promotes collaboration NEW_TASK out of reasoning", () => {
+  const payload = "read changes-audit.md and revert A4/A5/A7 only";
+  const normalized = normalizeGatewayInput([
+    {
+      type: "reasoning",
+      content: [{ type: "reasoning_text", text: `Message Type: NEW_TASK\nTask name: /root/revert_herdr\nPayload:\n${payload}` }],
+    },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "<recommended_plugins>\nCanva\n" }] },
+  ]);
+  assert.equal(normalized.at(-1).role, "user");
+  assert.equal(normalized.at(-1).content[0].text, payload);
+});
+
 test("compaction summaries round-trip through the kcr1 payload", () => {
   const encoded = encodeCompactionSummary("keep this handoff");
   assert.match(encoded, /^kcr1:/);
