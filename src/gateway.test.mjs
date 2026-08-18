@@ -1190,6 +1190,59 @@ test("pipeNormalizedStream separates sparse parallel calls with repeated upstrea
   ]);
 });
 
+for (const slug of ["deepseek-v4-flash@opencode-go", "deepseek-v4-flash@deepseek-official"]) {
+  test(`relayResponses frames sparse parallel send_message calls for ${slug}`, async () => {
+    const sink = collectStream();
+    const res = responseStub(sink);
+    const originalFetch = globalThis.fetch;
+    const bare = slug.split("@")[0];
+    globalThis.fetch = async () => new Response(
+      [
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_1","type":"function_call","name":"send_message","call_id":"call_1","arguments":""}}\n\n',
+        'data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"message\\":\\"verify herdr\\"}"}\n\n',
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"call_2","type":"function_call","name":"send_message","call_id":"call_2","arguments":""}}\n\n',
+        'data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"message\\":\\"verify db.sqlite\\"}"}\n\n',
+        `data: {"type":"response.completed","response":{"id":"resp_go","model":"${bare}"}}\n\n`,
+      ].join(""),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    );
+    try {
+      const config = configStub();
+      config.mainModel = slug;
+      const result = await relayResponses(
+        {
+          model: slug,
+          stream: true,
+          input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "verify in parallel" }] }],
+          tools: [{ type: "function", name: "send_message", parameters: { type: "object", properties: { message: { type: "string" } } } }],
+        },
+        res,
+        {
+          recordUsage: () => {},
+          config,
+          metrics: { begin: () => () => {}, recordResponseTransform: () => {}, recordResponseUsage: () => {} },
+          knownModels: new Set([slug]),
+          mainModel: slug,
+          visionModel: "none",
+        },
+      );
+      assert.equal(result.ok, true);
+      const events = Buffer.concat(sink.chunks).toString("utf8")
+        .split(/\r?\n\r?\n/)
+        .flatMap((block) => block.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5))));
+      const completed = events.find((event) => event.type === "response.completed");
+      assert.deepEqual(completed.response.output.map((item) => item.name), ["send_message", "send_message"]);
+      assert.deepEqual(
+        completed.response.output.map((item) => item.arguments),
+        ['{"message":"verify herdr"}', '{"message":"verify db.sqlite"}'],
+        "parallel send_message bodies stay on their own items instead of concatenating",
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
 test("redactBearer masks upstream tokens in error bodies", () => {
   const text = "Authorization: Bearer sk-abcdef123456, url https://x";
   const redacted = redactBearer(text);
@@ -2418,7 +2471,11 @@ test("relayResponses counts the request body bytes as transfer-in", async () => 
     recordResponseUsage: () => {},
   };
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => summaryResponse("ok");
+  globalThis.fetch = async () => new Response(
+    'data: {"type":"response.output_text.delta","delta":"ok","response":{"id":"resp_bytes","model":"deepseek-v4-flash"}}\n\n' +
+    'data: {"type":"response.completed","response":{"id":"resp_bytes","model":"deepseek-v4-flash","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":10,"output_tokens":5}}}\n\n',
+    { status: 200, headers: { "content-type": "text/event-stream" } },
+  );
   try {
     const payload = {
       model: "deepseek-v4-flash",

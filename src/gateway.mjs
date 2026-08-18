@@ -13,6 +13,7 @@ import {
   payloadHasModeldockTools,
   relayUpstreamWithModeldockTools,
 } from "./mcp-tool-relay.mjs";
+import { historicalImageSpawnHint } from "./subagent-guidance.mjs";
 
 // Hosted / special tool types Codex can emit that the Go and DeepSeek upstreams
 // reject. The catalog declarations are the primary control; stripping here is the
@@ -763,7 +764,7 @@ export function rewriteHistoricalImages(input, mediaStore, { preserveCurrentImag
       }
       return {
         type: "input_text",
-        text: `[Image attachment ${ref}. Its visual contents were handled in a prior turn. To re-inspect it, use vision_inspect with image_ref "${ref}", or spawn a vision subagent (agent_type="modeldock_subagent", fork_turns="none") to analyze it.]`,
+        text: historicalImageSpawnHint(ref),
       };
     });
     return changed ? { ...item, content } : item;
@@ -2561,10 +2562,9 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
       freeEmpty = result.empty;
       if (result.usage) usage = result.usage;
     } else {
-      const bareId = bareModelId(route.model);
-      // opencode's pro translation emits a bare-delta stream; the official
-      // DeepSeek route is a standard Responses implementation and stays native.
-      const piped = normalizedPayload.stream === true && bareId === "deepseek-v4-pro" && target.provider === "opencode-go"
+      // Codex points openai_base_url at this gate. Inspect SSE shape: sparse/bare
+      // tool streams are re-framed; a full Responses lifecycle passes through.
+      const piped = normalizedPayload.stream === true
         ? await pipeNormalizedStream(upstreamBody, res, tee, markFirstResponse)
         : await pipeGatewayStream(upstreamBody, res, tee, markFirstResponse);
       bytesOut = piped.bytes;
