@@ -1,11 +1,14 @@
 // Codex v2 spawn_agent is a local collaboration tool. The task argument is
 // `message`. Isolated forks (fork_turns="none") deliver that message as an
-// analysis-channel NEW_TASK. Native GPT-5 sees that channel; ModelDock text
-// models do not, so a none-fork child replies standby even when message was
-// filled. Measured 2026-08-19 on thread 01a00ee4: five none-forks with 900+
-// char messages, children never received them; send_message then returned
-// empty because the workers had already finished. Same-day GPT-5.6-sol
-// fork_turns="all" children inherited user turns and worked.
+// analysis-channel NEW_TASK. On the wire (Codex 0.148, 2026-08-19) that is an
+// agent_message whose header is input_text and whose payload is a sibling
+// encrypted_content part (plaintext, not a Fernet token). Native GPT-5 sees
+// that channel; ModelDock text models only read part.text, so a none-fork
+// child replies standby even when message was filled. Measured on thread
+// 01a00ee4: five none-forks with 900+ char messages, children never received
+// them; send_message then returned empty because the workers had already
+// finished. Same-day GPT-5.6-sol fork_turns="all" children inherited user
+// turns and worked.
 //
 // One string, used by the catalog and by image placeholders.
 
@@ -18,9 +21,23 @@ export function historicalImageSpawnHint(ref) {
 
 const NEW_TASK_RE = /Message Type:\s*NEW_TASK\b[\s\S]*?Payload:\s*\n?([\s\S]+)/i;
 
+// Same Fernet-shaped gate as gateway.mjs: whitespace-free gAAAA… tokens stay
+// opaque. Codex's collaboration channel puts the spawn `message` in a sibling
+// encrypted_content part that is actually plaintext.
+function isOpaqueEncryptedContent(value) {
+  return typeof value === "string" && /^gAAAA[A-Za-z0-9_-]+={0,2}$/.test(value);
+}
+
 export function newTaskPayloadFromText(text) {
   const match = String(text || "").match(NEW_TASK_RE);
   return match ? match[1].trim() : "";
+}
+
+function partPlainText(part) {
+  if (typeof part?.text === "string" && part.text) return part.text;
+  const blob = part?.encrypted_content;
+  if (typeof blob === "string" && blob && !isOpaqueEncryptedContent(blob)) return blob;
+  return "";
 }
 
 function itemPlainText(item) {
@@ -29,12 +46,15 @@ function itemPlainText(item) {
   const collect = (parts) => {
     if (!Array.isArray(parts)) return;
     for (const part of parts) {
-      if (typeof part?.text === "string") bits.push(part.text);
+      const text = partPlainText(part);
+      if (text) bits.push(text);
     }
   };
   collect(item.content);
   collect(item.summary);
   if (typeof item.text === "string") bits.push(item.text);
+  const own = item.encrypted_content;
+  if (typeof own === "string" && own && !isOpaqueEncryptedContent(own)) bits.push(own);
   return bits.join("\n");
 }
 

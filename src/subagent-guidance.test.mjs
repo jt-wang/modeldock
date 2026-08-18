@@ -41,3 +41,52 @@ test("promoteCollaborationNewTask is a no-op when the user turn already has the 
   ];
   assert.equal(promoteCollaborationNewTask(input), input);
 });
+
+// Live Codex 0.148 spawn (thread 01a015c7 child Bernoulli, 2026-08-19): the
+// NEW_TASK header is plaintext, the spawn `message` is a sibling
+// encrypted_content part. Native GPT decrypts that channel; DeepSeek only
+// reads part.text, so the promoter used to no-op and the child went standby
+// (or re-spawned from a forked parent prompt).
+test("promoteCollaborationNewTask joins a split NEW_TASK header and encrypted payload", () => {
+  const payload = "Write the exact token VERIFIED-SUBAGENT-TASK-9de2 into RESULT.txt";
+  const input = [
+    {
+      type: "agent_message",
+      author: "/root",
+      recipient: "/root/verify_subagent_delivery",
+      content: [
+        {
+          type: "input_text",
+          text: "Message Type: NEW_TASK\nTask name: /root/verify_subagent_delivery\nSender: /root\nPayload:\n",
+        },
+        { type: "encrypted_content", encrypted_content: payload },
+      ],
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "<recommended_plugins>\nAirtable\n" }],
+    },
+  ];
+  const out = promoteCollaborationNewTask(input);
+  const users = out.filter((item) => item.type === "message" && item.role === "user");
+  assert.equal(users.at(-1).content[0].text, payload);
+});
+
+test("promoteCollaborationNewTask does not treat opaque Fernet blobs as a task", () => {
+  const input = [
+    {
+      type: "agent_message",
+      content: [
+        { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
+        { type: "encrypted_content", encrypted_content: "gAAAAABopaque_native_cipher_token" },
+      ],
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "<recommended_plugins>\nAirtable\n" }],
+    },
+  ];
+  assert.equal(promoteCollaborationNewTask(input), input);
+});

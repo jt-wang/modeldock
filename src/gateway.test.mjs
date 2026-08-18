@@ -140,6 +140,25 @@ test("normalizeGatewayInput promotes collaboration NEW_TASK out of reasoning", (
   assert.equal(normalized.at(-1).content[0].text, payload);
 });
 
+test("normalizeGatewayInput promotes the live split NEW_TASK agent_message shape", () => {
+  const payload = "Write the exact token VERIFIED-SUBAGENT-TASK-9de2 into RESULT.txt";
+  const normalized = normalizeGatewayInput([
+    {
+      type: "agent_message",
+      content: [
+        {
+          type: "input_text",
+          text: "Message Type: NEW_TASK\nTask name: /root/verify_subagent_delivery\nSender: /root\nPayload:\n",
+        },
+        { type: "encrypted_content", encrypted_content: payload },
+      ],
+    },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "<recommended_plugins>\nCanva\n" }] },
+  ]);
+  assert.equal(normalized.at(-1).role, "user");
+  assert.equal(normalized.at(-1).content[0].text, payload);
+});
+
 test("compaction summaries round-trip through the kcr1 payload", () => {
   const encoded = encodeCompactionSummary("keep this handoff");
   assert.match(encoded, /^kcr1:/);
