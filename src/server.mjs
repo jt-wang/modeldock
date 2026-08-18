@@ -1697,6 +1697,10 @@ export async function startServer(config = loadConfig()) {
     url: `http://${urlHost(config.host)}:${config.port}`,
     async stop() {
       await instance.close();
+      // Codex (and browsers) leave keep-alive sockets. server.close() waits for
+      // them, so SIGTERM would drop LISTEN while the process stayed alive and
+      // launchd KeepAlive would never relaunch. Destroy leftovers first.
+      server.closeAllConnections?.();
       await new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     },
   };
@@ -1734,7 +1738,17 @@ if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToP
   const shutdown = async (signal) => {
     console.error(`[modeldock] shutting down on ${signal}`);
     clearOwnerFile(instance.services.config.port);
-    await instance.stop();
+    const force = setTimeout(() => {
+      console.error("[modeldock] shutdown timed out; exiting");
+      process.exit(0);
+    }, 2000);
+    force.unref();
+    try {
+      await instance.stop();
+    } catch (error) {
+      console.error(`[modeldock] shutdown error: ${error.message}`);
+    }
+    clearTimeout(force);
     process.exit(0);
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
