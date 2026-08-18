@@ -102,6 +102,34 @@ test("a genuinely new image after a tool-call turn still routes to vision", () =
   assert.equal(route.model, "gpt-5.6-luna");
 });
 
+test("does not hijack a long agentic thread onto the vision model just because the current turn has an image", () => {
+  // Codex keeps the full tool/reasoning history on every follow-up. Escalating
+  // that payload to MIMO/Luna is what Console Go rejects with 400 Param Incorrect
+  // after a screenshot lands in an already-long session.
+  const input = [];
+  for (let i = 0; i < 12; i += 1) {
+    input.push({ type: "message", role: "user", content: [{ type: "input_text", text: `step ${i}` }] });
+    input.push({ type: "reasoning", status: "completed", content: [{ type: "reasoning_text", text: "think" }] });
+    input.push({ type: "function_call", call_id: `c${i}`, name: "shell", arguments: "{}" });
+    input.push({ type: "function_call_output", call_id: `c${i}`, output: "ok" });
+  }
+  input.push({
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "continue" },
+      { type: "input_image", image_url: "data:image/png;base64,BB==" },
+    ],
+  });
+  const route = routeResponsesRequest(
+    { model: "deepseek-v4-flash", input },
+    { mainModel: "deepseek-v4-flash", visionModel: "mimo-v2.5", knownModels: new Set(["deepseek-v4-flash"]) },
+  );
+  assert.notEqual(route.reason, "current_turn_image", "a 50-item tool thread must stay on the text model");
+  assert.equal(route.model, "deepseek-v4-flash");
+  assert.equal(route.directVision, false);
+});
+
 test("does not treat Codex developer instructions about image support as user visual intent", () => {
   const route = routeResponsesRequest({ input: [
     { role: "developer", content: [{ type: "input_text", text: "When users attach an image, inspect it carefully." }] },

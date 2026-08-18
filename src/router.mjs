@@ -40,6 +40,31 @@ function hasImage(items) {
   return items.some((item) => parts(item).some((part) => part?.type === "input_image" && typeof part.image_url === "string"));
 }
 
+// Console Go 400s "Param Incorrect" when a 100+ item tool/reasoning history is
+// shipped to the vision model (MIMO). A short screenshot turn is fine to
+// escalate; an already-agentic thread must stay on the text model and inspect
+// via vision_inspect instead of hijacking the whole payload.
+const AGENTIC_ITEM_TYPES = new Set([
+  "function_call",
+  "function_call_output",
+  "custom_tool_call",
+  "custom_tool_call_output",
+  "reasoning",
+]);
+
+export function isHeavyAgenticHistory(input) {
+  const items = inputItems(input);
+  if (items.length >= 40) return true;
+  let agentic = 0;
+  for (const item of items) {
+    if (AGENTIC_ITEM_TYPES.has(item?.type)) {
+      agentic += 1;
+      if (agentic >= 8) return true;
+    }
+  }
+  return false;
+}
+
 function continuationCallIds(items) {
   return items
     .filter((item) => item?.type === "function_call_output" || item?.type === "custom_tool_call_output")
@@ -114,7 +139,7 @@ export function routeResponsesRequest(source, { mainModel, visionModel, affinity
     // profile, so the request silently hit the dashboard provider with an empty
     // model id. Keep the turn where it belongs instead.
     const target = requested && knownModels?.has(requested) ? requested : mainModel;
-    if (visionModel && !modelSeesImages?.(target)) {
+    if (visionModel && !modelSeesImages?.(target) && !isHeavyAgenticHistory(source?.input)) {
       return { model: visionModel, reason: "current_turn_image", directVision: true };
     }
   }

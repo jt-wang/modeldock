@@ -775,6 +775,27 @@ test("routeGatewayRequest escalates current-turn images to the vision model", ()
   assert.equal(route.reason, "current_turn_image");
 });
 
+test("routeGatewayRequest keeps a long agentic thread on the main model even with a current-turn image", () => {
+  const input = [];
+  for (let i = 0; i < 12; i += 1) {
+    input.push({ type: "function_call", call_id: `c${i}`, name: "shell", arguments: "{}" });
+    input.push({ type: "function_call_output", call_id: `c${i}`, output: "ok" });
+  }
+  input.push({ type: "message", role: "user", content: [{ type: "input_image", image_url: "https://example.com/x.png" }] });
+  const route = routeGatewayRequest(
+    { model: "deepseek-v4-flash", input },
+    {
+      mainModel: "deepseek-v4-flash",
+      visionModel: "mimo-v2.5",
+      affinity: new RouteAffinity(),
+      knownModels: new Set(["deepseek-v4-flash", "mimo-v2.5"]),
+    },
+  );
+  assert.equal(route.model, "deepseek-v4-flash");
+  assert.equal(route.directVision, false);
+  assert.notEqual(route.reason, "current_turn_image");
+});
+
 test("applyToolPolicy keeps view_image for a model that can see", () => {
   // view_image shows the human a local image file. It is hidden from the
   // text-only models because they cannot interpret what they open, but a
@@ -1238,6 +1259,65 @@ test("relayResponses forwards a streamed response and records usage", async () =
     assert.equal(finished.outputTokens, 2, "finish must carry output tokens onto the trace record");
     assert.equal(usageEvents[0].cachedTokens, 3, "usage event must carry cached tokens from the upstream details");
     assert.equal(usageEvents[0].reasoningTokens, 1, "usage event must carry reasoning tokens from the upstream details");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("relayResponses does not ship a long agentic thread to the vision model when the current turn has an image", async () => {
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    calls.push(JSON.parse(options.body));
+    return new Response(
+      JSON.stringify({
+        id: "resp_main",
+        object: "response",
+        status: "completed",
+        model: "deepseek-v4-flash",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+  const input = [];
+  for (let i = 0; i < 12; i += 1) {
+    input.push({ type: "function_call", call_id: `c${i}`, name: "shell", arguments: "{}" });
+    input.push({ type: "function_call_output", call_id: `c${i}`, output: "ok" });
+  }
+  input.push({
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "continue" },
+      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+    ],
+  });
+  try {
+    const result = await relayResponses(
+      { model: "deepseek-v4-flash", stream: false, input },
+      res,
+      {
+        config: { ...configStub(), visionModel: "mimo-v2.5" },
+        metrics: { begin: () => () => {}, recordResponseTransform: () => {}, recordResponseUsage: () => {} },
+        routeAffinity: new RouteAffinity(),
+        knownModels: new Set(["deepseek-v4-flash", "mimo-v2.5"]),
+        mainModel: "deepseek-v4-flash",
+        visionModel: "mimo-v2.5",
+      },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.route.model, "deepseek-v4-flash");
+    assert.notEqual(result.route.reason, "current_turn_image");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].model, "deepseek-v4-flash");
+    assert.ok(
+      !JSON.stringify(calls[0].input).includes("input_image"),
+      "the text model must receive image refs, not pixels",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

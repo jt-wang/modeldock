@@ -2484,6 +2484,16 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
       nativeToolOutputs: 0,
       fallbackToolResults: 0,
     }, { streaming: false, routeReason: route.reason, bytesIn });
+      (services.recordUsage || recordUsageEvent)({
+        model: normalizedPayload.model,
+        provider: target.provider,
+        route: route.reason,
+        status: upstream.status,
+        durationMs: Date.now() - startedAt,
+        sessionId,
+        threadId,
+        error: translated.body.error.message.slice(0, 400),
+      });
       return { ok: false, httpStatus: upstream.status, route, error: translated.body.error.message.slice(0, 400), upstreamBytes };
     }
 
