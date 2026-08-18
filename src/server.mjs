@@ -1708,7 +1708,14 @@ if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToP
   if (migration.migrated > 0) {
     console.log(`Encrypted ${migration.migrated} secret(s) in ${migration.file} (backup: ${migration.backup})`);
   }
-  const instance = await startServer();
+  let instance;
+  try {
+    instance = await startServer();
+  } catch (error) {
+    const code = error?.code ? ` (${error.code})` : "";
+    console.error(`[modeldock] failed to listen: ${error?.message || error}${code}`);
+    process.exit(1);
+  }
   // Record port ownership so restart.ps1 and future instances can tell whose
   // process holds the port (we have shipped stale code from a lookalike
   // instance before). A conflict only warns: the listen already succeeded.
@@ -1724,11 +1731,12 @@ if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToP
     .map(([provider]) => provider);
   if (missingTokens.length) console.warn(`Tokens missing for provider(s): ${missingTokens.join(", ")}; the dashboard is available but those upstream calls will return 503.`);
 
-  const shutdown = async () => {
+  const shutdown = async (signal) => {
+    console.error(`[modeldock] shutting down on ${signal}`);
     clearOwnerFile(instance.services.config.port);
     await instance.stop();
     process.exit(0);
   };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
 }

@@ -172,8 +172,10 @@ if try_launchd_restart; then
   if wait_for_health "$OLD_PID"; then
     exit 0
   fi
-  status "WARNING: launchd restart did not become healthy; falling back to manual restart"
-  OLD_PID="$(find_listener_pid)"
+  # A second nohup copy on the same port races launchd KeepAlive (EADDRINUSE
+  # crash loop, Codex sees a dead gate). Stay with the launchd-owned process.
+  status "ERROR: launchd restart did not become healthy; not starting a second copy"
+  exit 1
 fi
 
 if [ -n "$OLD_PID" ]; then

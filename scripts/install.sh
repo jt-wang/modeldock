@@ -730,8 +730,10 @@ if try_launchd_restart; then
   if wait_for_health "$OLD_PID"; then
     exit 0
   fi
-  status "WARNING: launchd restart did not become healthy; falling back to manual restart"
-  OLD_PID="$(find_listener_pid)"
+  # A second nohup copy on the same port races launchd KeepAlive (EADDRINUSE
+  # crash loop, Codex sees a dead gate). Stay with the launchd-owned process.
+  status "ERROR: launchd restart did not become healthy; not starting a second copy"
+  exit 1
 fi
 
 if [ -n "$OLD_PID" ]; then
@@ -904,12 +906,7 @@ restart_gateway() {
 }
 
 restore_native() {
-  KEY_FILE="${MODELDOCK_STATE_DIR:-$ROOT}/caller-key"
-  KEY=""
-  if [ -f "$KEY_FILE" ]; then
-    KEY="$(tr -d '\r\n' < "$KEY_FILE")"
-  fi
-  if [ -n "$KEY" ] && curl -fsS --max-time 3 -X POST -H "x-modeldock-key: $KEY" "http://127.0.0.1:$PORT/api/config/disable" >/dev/null 2>&1; then
+  if curl -fsS --max-time 3 -X POST "http://127.0.0.1:$PORT/api/config/disable" >/dev/null 2>&1; then
     echo "Codex native route restored through the running gateway."
     return
   fi

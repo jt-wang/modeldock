@@ -161,3 +161,85 @@ http.createServer((req, res) => {
   assert.match(output, /ownership could not be verified|owner record is missing/i);
   assert.ok(await waitForHealth(port, "foreign"), "foreign listener must survive the refused restart");
 });
+
+test("restart.sh does not nohup a second copy when launchd already owns the gateway", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("launchd ownership path is macOS-only");
+    return;
+  }
+
+  const probe = createServer();
+  const port = await listen(probe);
+  await new Promise((resolve) => probe.close(resolve));
+
+  const root = mkdtempSync(path.join(os.tmpdir(), "modeldock-restart-launchd-"));
+  const stateDir = path.join(root, ".state");
+  const fakeBin = path.join(root, "fakebin");
+  mkdirSync(path.join(root, "scripts"), { recursive: true });
+  mkdirSync(path.join(root, "dist"), { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(fakeBin, { recursive: true });
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+
+  const launchctlLog = path.join(root, "launchctl.log");
+  writeFileSync(path.join(fakeBin, "launchctl"), `#!/bin/sh
+printf '%s\\n' "$*" >> ${JSON.stringify(launchctlLog)}
+case "$1" in
+  print) exit 0 ;;
+  kickstart) exit 0 ;;
+esac
+exit 0
+`, { mode: 0o755 });
+  writeFileSync(path.join(root, ".env"), `MODELDOCK_PORT=${port}\n`, "utf8");
+  writeFileSync(path.join(root, "scripts", "restart.sh"), readFileSync(path.join(repoRoot, "scripts", "restart.sh")), { mode: 0o755 });
+  writeFileSync(
+    path.join(root, "dist", "modeldock.mjs"),
+    `import http from "node:http";
+http.createServer((req, res) => {
+  if (req.url === "/healthz") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, marker: "second-copy" }));
+    return;
+  }
+  res.writeHead(404); res.end();
+}).listen(Number(process.env.MODELDOCK_PORT), "127.0.0.1");
+`,
+    "utf8",
+  );
+
+  const owned = spawn(process.execPath, ["--input-type=module", "-e", `
+import http from "node:http";
+http.createServer((req, res) => {
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true, marker: "launchd-owned" }));
+}).listen(Number(process.env.MODELDOCK_PORT), "127.0.0.1");
+`], { env: { ...process.env, MODELDOCK_PORT: String(port) }, stdio: "ignore" });
+  t.after(() => owned.kill("SIGKILL"));
+  assert.ok(await waitForHealth(port, "launchd-owned"));
+  writeFileSync(
+    path.join(stateDir, `owner-${port}.json`),
+    `${JSON.stringify({ pid: owned.pid, root, port }, null, 2)}\n`,
+    "utf8",
+  );
+
+  const child = spawn("sh", [path.join(root, "scripts", "restart.sh"), "--force"], {
+    env: {
+      ...process.env,
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
+      MODELDOCK_PORT: String(port),
+      MODELDOCK_STATE_DIR: stateDir,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+  const exitCode = await new Promise((resolve) => child.on("close", resolve));
+  assert.equal(exitCode, 1, output);
+  assert.match(output, /restarting launchd service/);
+  assert.match(output, /not starting a second copy|did not become healthy/);
+  assert.doesNotMatch(output, /started gateway from/);
+  assert.ok(await waitForHealth(port, "launchd-owned"), "the launchd-owned listener must not be replaced by a nohup copy");
+  const launchctlCalls = readFileSync(launchctlLog, "utf8");
+  assert.match(launchctlCalls, /kickstart/, `launchctl should be asked to restart the service\n${launchctlCalls}`);
+});
