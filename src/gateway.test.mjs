@@ -1216,6 +1216,80 @@ test("relayResponses forwards a streamed response and records usage", async () =
   }
 });
 
+test("relayResponses executes modeldock MCP tools server-side instead of forwarding them to Codex", async () => {
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const finishResults = [];
+  const transformReports = [];
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({
+        id: "resp_md_1",
+        status: "completed",
+        output: [{
+          type: "function_call",
+          call_id: "call_vis",
+          name: "mcp__modeldock__vision_inspect",
+          arguments: JSON.stringify({ path: "/tmp/ui.png", question: "describe", mode: "ui" }),
+        }],
+        usage: { input_tokens: 5, output_tokens: 2 },
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return new Response(JSON.stringify({
+      id: "resp_md_2",
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Dark sidebar with three panes." }],
+      }],
+      usage: { input_tokens: 12, output_tokens: 6 },
+    }), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  try {
+    const result = await relayResponses(
+      {
+        model: "deepseek-v4-flash",
+        stream: true,
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "inspect ui" }] }],
+        tools: [{ type: "function", name: "mcp__modeldock__vision_inspect", parameters: {} }],
+      },
+      res,
+      {
+        recordUsage: () => {},
+        config: configStub(),
+        metrics: {
+          begin: () => (payload) => finishResults.push(payload),
+          recordResponseTransform: (report) => transformReports.push(report),
+          recordResponseUsage: () => {},
+        },
+        routeAffinity: new RouteAffinity(),
+        knownModels: new Set(["deepseek-v4-flash", "gpt-5.6-luna"]),
+        mainModel: "deepseek-v4-flash",
+        visionModel: "gpt-5.6-luna",
+        upstreams: {
+          inspectVision: async () => ({ answer: "dark sidebar", model: "mimo-v2.5" }),
+        },
+      },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 2, "gateway loops upstream after executing vision_inspect");
+    assert.equal(calls[0].stream, false);
+    const toolOutput = calls[1].input.find((item) => item.type === "function_call_output");
+    assert.match(toolOutput.output, /dark sidebar/);
+    const forwarded = Buffer.concat(sink.chunks).toString("utf8");
+    assert.match(forwarded, /Dark sidebar with three panes/);
+    assert.doesNotMatch(forwarded, /mcp__modeldock__vision_inspect/);
+    assert.equal(transformReports.at(-1).fallbackToolResults, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("relayResponses drops reasoning for a model with no effort control", async () => {
   // Twelve of the published models expose only a thinking on/off toggle, or
   // nothing at all - the strings low/high/xhigh appear nowhere in their vendors'

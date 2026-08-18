@@ -8,6 +8,11 @@ import { recordUsageEvent } from "./usage-events.mjs";
 import { translateUpstreamError, freeEmptyOutputError } from "./error-translation.mjs";
 import { RouteAffinity, routeResponsesRequest, isAssistantMarker } from "./router.mjs";
 import { extractResponseUsage } from "./metrics.mjs";
+import {
+  healUnsupportedModeldockOutputs,
+  payloadHasModeldockTools,
+  relayUpstreamWithModeldockTools,
+} from "./mcp-tool-relay.mjs";
 
 // Hosted / special tool types Codex can emit that the Go and DeepSeek upstreams
 // reject. The catalog declarations are the primary control; stripping here is the
@@ -1878,6 +1883,37 @@ function writeCompactionSse(res, model, summary) {
   res.end("data: [DONE]\n\n");
 }
 
+// Emit a completed Responses object as a minimal SSE stream for Codex clients
+// that requested stream=true but whose modeldock tool loop ran non-streaming.
+function writeCompletedResponseSse(res, response, tee, onFirstResponse) {
+  const respId = response?.id || `resp_${randomUUID().replaceAll("-", "")}`;
+  const wrapped = { ...response, id: respId, status: response?.status || "completed" };
+  const events = [
+    { type: "response.created", response: { ...wrapped, status: "in_progress" } },
+    ...(Array.isArray(wrapped.output) ? wrapped.output.map((item, output_index) => ({
+      type: "response.output_item.done",
+      output_index,
+      item,
+    })) : []),
+    { type: "response.completed", response: wrapped },
+  ];
+  if (!res.headersSent) {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.flushHeaders();
+  }
+  onFirstResponse?.();
+  for (const event of events) {
+    const line = `data: ${JSON.stringify(event)}\n\n`;
+    tee?.push?.(Buffer.from(line));
+    res.write(line);
+  }
+  tee?.end?.();
+  res.end("data: [DONE]\n\n");
+  return wrapped;
+}
+
 // Synthesize the compaction response Codex expects instead of forwarding the
 // compact request to a routed model that would answer with a plain summary.
 // The model is asked for a handoff summary in a separate non-streaming call;
@@ -2278,13 +2314,130 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
   });
 
   try {
+    const upstreamBytes = Buffer.byteLength(JSON.stringify(normalizedPayload));
+    const { upstreams } = services;
+    if (upstreams) {
+      const healed = await healUnsupportedModeldockOutputs(normalizedPayload.input, upstreams);
+      if (healed.healed) normalizedPayload.input = healed.input;
+    }
+    if (upstreams && payloadHasModeldockTools(tools)) {
+      const relayed = await relayUpstreamWithModeldockTools({
+        payload: normalizedPayload,
+        upstreamModel,
+        target,
+        upstreamHeaders,
+        upstreams,
+        signal,
+      });
+      if (!relayed.ok) {
+        markFirstResponse();
+        const translated = translateUpstreamError({
+          provider: target.provider,
+          status: relayed.httpStatus || 502,
+          bodyText: redactBearer(relayed.raw || relayed.error || ""),
+          free: target.free,
+        });
+        const body = JSON.stringify(translated.body);
+        if (!res.headersSent) {
+          res.statusCode = relayed.httpStatus || 502;
+          res.setHeader("Content-Type", "application/json");
+          res.end(body);
+        }
+        finish?.({
+          ok: false,
+          httpStatus: relayed.httpStatus || 502,
+          upstream: target.provider,
+          error: translated.body.error.message.slice(0, 400),
+          requestShape: describeInputShape(normalizedPayload.input),
+        });
+        metrics?.recordResponseTransform?.({
+          blocked: { tool_search: stripped.toolSearch, web_search: stripped.webSearch },
+          toolChoiceRewritten: false,
+          imageRefs: [],
+          directVision: route.directVision,
+          droppedAssistantMessages: 0,
+          nativeToolCalls: 0,
+          nativeToolOutputs: 0,
+          fallbackToolResults: relayed.fallbackToolResults || 0,
+        }, { streaming: normalizedPayload.stream !== false, routeReason: route.reason, bytesIn });
+        return { ok: false, httpStatus: relayed.httpStatus || 502, route, error: translated.body.error.message.slice(0, 400), upstreamBytes };
+      }
+      usage = relayed.response?.usage;
+      completedResponse = relayed.response;
+      responseCompleted = true;
+      if (normalizedPayload.stream === true) {
+        completedResponse = writeCompletedResponseSse(res, relayed.response, tee, markFirstResponse);
+        bytesOut = Buffer.byteLength(JSON.stringify(relayed.response));
+      } else {
+        markFirstResponse();
+        const body = JSON.stringify(relayed.response);
+        bytesOut = Buffer.byteLength(body);
+        if (!res.headersSent) {
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(body);
+        } else {
+          res.end(body);
+        }
+        tee?.push?.(Buffer.from(body));
+        tee?.end?.();
+      }
+      if (completedResponse && routeAffinity) {
+        routeAffinity.registerResponse(completedResponse, route.model);
+      }
+      finish?.({
+        ok: true,
+        httpStatus: 200,
+        upstream: target.provider,
+        bytesOut,
+        inputTokens: usage?.input_tokens || 0,
+        outputTokens: usage?.output_tokens || 0,
+        cachedTokens: usage?.input_tokens_details?.cached_tokens || 0,
+        reasoningTokens: usage?.output_tokens_details?.reasoning_tokens || 0,
+      });
+      metrics?.recordResponseTransform?.({
+        blocked: { tool_search: stripped.toolSearch, web_search: stripped.webSearch },
+        toolChoiceRewritten: false,
+        imageRefs: [],
+        directVision: route.directVision,
+        droppedAssistantMessages: 0,
+        nativeToolCalls: 0,
+        nativeToolOutputs: 0,
+        fallbackToolResults: relayed.fallbackToolResults || 0,
+      }, { streaming: normalizedPayload.stream !== false, routeReason: route.reason, bytesIn });
+      metrics?.recordResponseUsage?.({ bytesOut, usage });
+      (services.recordUsage || recordUsageEvent)({
+        model: normalizedPayload.model,
+        provider: target.provider,
+        route: route.reason,
+        status: 200,
+        durationMs: Date.now() - startedAt,
+        inputTokens: usage?.input_tokens,
+        outputTokens: usage?.output_tokens,
+        totalTokens: usage?.total_tokens,
+        cachedTokens: usage?.input_tokens_details?.cached_tokens,
+        reasoningTokens: usage?.output_tokens_details?.reasoning_tokens,
+        sessionId,
+        threadId,
+      });
+      return {
+        ok: true,
+        httpStatus: 200,
+        route,
+        usage,
+        bytesOut,
+        latencyMs: Date.now() - startedAt,
+        upstream: target.provider,
+        upstreamBytes,
+      };
+    }
+
     const upstream = await fetch(target.url, {
       method: "POST",
       headers: upstreamHeaders(target),
       body: JSON.stringify({ ...normalizedPayload, model: upstreamModel }),
       signal,
     });
-    const upstreamBytes = Buffer.byteLength(JSON.stringify(normalizedPayload));
     if (!upstream.ok) {
       markFirstResponse();
       if (config.debug?.dumpDir) {

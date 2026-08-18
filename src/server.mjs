@@ -652,6 +652,7 @@ async function relayGatewayRequest(req, res, services) {
     metrics,
     mediaStore,
     routeAffinity,
+    upstreams: services.upstreams,
     knownModels: publishedModelIds(config),
     nativeSlugs: services.nativeSlugs,
     mainModel: modelSelection?.mainModel || config.mainModel,
