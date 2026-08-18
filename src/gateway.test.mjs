@@ -649,8 +649,35 @@ test("applyToolPolicy flattens MCP namespaces into qualified functions", () => {
   assert.equal(kept.length, 1);
   assert.equal(kept[0].type, "function");
   assert.equal(kept[0].name, "namespace:mcp__test__hello");
+  assert.equal(kept[0].parameters.type, "object");
   assert.equal(stripped.namespaceChildren, 1);
   assert.equal(stripped.hidden, 1);
+});
+
+test("applyToolPolicy maps inputSchema to parameters for upstream compatibility", () => {
+  const tools = [
+    {
+      type: "namespace",
+      name: "mcp__modeldock",
+      tools: [
+        {
+          type: "function",
+          name: "vision_inspect",
+          inputSchema: {
+            type: "object",
+            properties: { question: { type: "string" } },
+            required: ["question"],
+            additionalProperties: false,
+          },
+        },
+      ],
+    },
+  ];
+  const { tools: kept } = applyToolPolicy(tools);
+  assert.equal(kept[0].name, "mcp__modeldock__vision_inspect");
+  assert.equal(kept[0].parameters.type, "object");
+  assert.equal(kept[0].parameters.required[0], "question");
+  assert.equal(kept[0].inputSchema, undefined);
 });
 
 test("upstreamTargetFor routes by owning provider", () => {

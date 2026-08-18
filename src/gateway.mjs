@@ -793,6 +793,19 @@ export function adaptImageUrlShape(input, shape) {
   return changed ? out : input;
 }
 
+// OpenCode Go rejects function tools whose parameters schema is missing or not
+// type:"object" (Codex MCP children often carry inputSchema instead of parameters).
+function normalizeFunctionTool(tool) {
+  if (!tool || typeof tool !== "object") return tool;
+  const parameters = tool.parameters ?? tool.inputSchema;
+  const normalized = parameters && typeof parameters === "object" && parameters.type === "object"
+    ? parameters
+    : { type: "object", properties: {}, additionalProperties: false };
+  const next = { ...tool, type: "function", parameters: normalized };
+  delete next.inputSchema;
+  return next;
+}
+
 // Tool policy: keep standard function/custom tools, flatten MCP namespaces so
 // text models see plain functions, and strip hosted schemas plus tools the model
 // cannot use. Returns the filtered list and a report of what was removed.
@@ -816,7 +829,7 @@ export function applyToolPolicy(tools, { hiddenToolNames = TEXT_MODEL_HIDDEN_TOO
           continue;
         }
         stripped.namespaceChildren += 1;
-        out.push({ ...structuredClone(child), type: "function", name: `${tool.name}__${child.name}` });
+        out.push(normalizeFunctionTool({ ...structuredClone(child), type: "function", name: `${tool.name}__${child.name}` }));
       }
       continue;
     }
@@ -830,7 +843,7 @@ export function applyToolPolicy(tools, { hiddenToolNames = TEXT_MODEL_HIDDEN_TOO
       stripped.hidden += 1;
       continue;
     }
-    out.push(structuredClone(tool));
+    out.push(tool.type === "function" ? normalizeFunctionTool(structuredClone(tool)) : structuredClone(tool));
   }
   return { tools: out, stripped };
 }
