@@ -1891,13 +1891,19 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
   if (requestedModel !== payload.model && requestedModel) payload = { ...payload, model: requestedModel };
   const mainModel = services.mainModel || config.mainModel;
   const visionModel = services.visionModel || config.visionModel;
-  const route = routeGatewayRequest(payload, {
-    mainModel,
-    visionModel,
-    affinity: routeAffinity,
-    knownModels,
-    modelSeesImages: (model) => Boolean(modelEntryFor(config, model)?.supportsVision),
-  });
+  // Compact is always a text handoff for the main model. Vision escalation is for
+  // user turns with images, not for summarize - routing a 100+ item tool/reasoning
+  // history to MIMO (or similar) gets 400 Param Incorrect from Console Go.
+  const compactModel = (
+    requestedModel
+    && knownModels?.has(requestedModel)
+    && !modelEntryFor(config, requestedModel)?.supportsVision
+  ) ? requestedModel : mainModel;
+  const route = {
+    model: compactModel,
+    reason: "compact_summarize",
+    directVision: false,
+  };
   const summarizeBody = {
     ...payload,
     model: route.model,
@@ -1906,12 +1912,7 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     tool_choice: "none",
     input: [
       ...rewriteHistoricalImages(normalizeGatewayInput(payload.input), mediaStore, {
-        // Keep the real image whenever the model receiving it can read it:
-        // on the escalation path (directVision), and also when a vision-capable
-        // model keeps its own turn - stripping it there blinds the one model
-        // that did not need help.
-        preserveCurrentImages: route.directVision
-          || Boolean(modelEntryFor(config, route.model)?.supportsVision),
+        preserveCurrentImages: false,
       }),
       messageItem(COMPACT_PROMPT),
     ],
