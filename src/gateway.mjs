@@ -711,7 +711,8 @@ export function normalizeOpenCodeProInput(input) {
 
 // A message is "current" when it follows the last assistant turn. In the
 // Responses wire an assistant turn is not always a role:"assistant" message: an
-// agentic turn is frequently a bare function_call / reasoning item. This mirrors
+// agentic turn is frequently a bare function_call / reasoning item, and a
+// compact checkpoint is a `compaction` item with no assistant role. This mirrors
 // router.mjs's isAssistantMarker so the rewrite's notion of "current" matches the
 // turn that triggered vision escalation.
 function currentTurnStart(input) {

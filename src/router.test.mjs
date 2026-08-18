@@ -58,6 +58,36 @@ test("a tool-call-only assistant turn ends the turn; a stale image behind it doe
   assert.equal(route.model, "deepseek-v4-flash");
 });
 
+test("a compaction item ends the turn; a stale image behind it does not re-trigger vision", () => {
+  // Compacted history keeps older user messages (including screenshots) and a
+  // compaction item, with no role:assistant / function_call marker. Without
+  // treating compaction as a turn boundary, lastMarker stays -1 and every later
+  // text follow-up is swallowed into "current turn" and hijacked to vision.
+  const route = routeResponsesRequest({
+    model: "deepseek-v4-flash",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "look" }, { type: "input_image", image_url: "data:image/jpeg;base64,AA==" }] },
+      { type: "compaction", id: "cmp_1", encrypted_content: "kcr1:e30=" },
+      { role: "user", content: [{ type: "input_text", text: "continue" }] },
+    ],
+  }, { mainModel: "deepseek-v4-flash", visionModel: "gpt-5.6-luna", knownModels: new Set(["deepseek-v4-flash"]) });
+  assert.notEqual(route.reason, "current_turn_image", "a stale image behind compaction must not re-trigger vision");
+  assert.equal(route.model, "deepseek-v4-flash");
+});
+
+test("a genuinely new image after compaction still routes to vision", () => {
+  const route = routeResponsesRequest({
+    model: "deepseek-v4-flash",
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "start" }] },
+      { type: "compaction", id: "cmp_1", encrypted_content: "kcr1:e30=" },
+      { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,BB==" }] },
+    ],
+  }, { mainModel: "deepseek-v4-flash", visionModel: "gpt-5.6-luna", knownModels: new Set(["deepseek-v4-flash"]) });
+  assert.equal(route.reason, "current_turn_image");
+  assert.equal(route.model, "gpt-5.6-luna");
+});
+
 test("a genuinely new image after a tool-call turn still routes to vision", () => {
   const route = routeResponsesRequest({
     model: "deepseek-v4-flash",

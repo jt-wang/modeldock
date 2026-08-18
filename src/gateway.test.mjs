@@ -555,6 +555,15 @@ test("currentTurnStart is the item after the last assistant turn (or agentic mar
     ]),
     2,
   );
+  assert.equal(
+    currentTurnStartForTesting([
+      { type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/jpeg;base64,AA==" }] },
+      { type: "compaction", id: "cmp_1", encrypted_content: "kcr1:e30=" },
+      { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+    ]),
+    2,
+    "compaction is a turn boundary so a follow-up after it is the current turn",
+  );
 });
 
 test("rewriteHistoricalImages replaces all images with refs by default", () => {
