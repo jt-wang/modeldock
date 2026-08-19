@@ -136,6 +136,18 @@ function writeCompactFailureReport(report) {
   }
 }
 
+function writeRelayFailureReport(report) {
+  try {
+    const dir = process.env.MODELDOCK_STATE_DIR
+      ? path.resolve(process.env.MODELDOCK_STATE_DIR)
+      : path.join(homedir(), ".modeldock");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "relay-failures.jsonl"), `${JSON.stringify(report)}\n`, { encoding: "utf8", flag: "a" });
+  } catch {
+    // Diagnostics must never take a request down.
+  }
+}
+
 // Native GPT passthrough (the parallel leg). Model slugs the catalog does not
 // publish - the built-in provider's own GPT-5.x ids that the App picker lists
 // from its native model list - are forwarded verbatim to ChatGPT's Codex
@@ -809,15 +821,31 @@ export function flattenChatToolCallsToResponses(input) {
   return out;
 }
 
+function stripAssistantToolCalls(input) {
+  if (!Array.isArray(input)) return input;
+  return input.map((item) => {
+    if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item.tool_calls)) {
+      const { tool_calls: _calls, ...rest } = item;
+      return rest;
+    }
+    return item;
+  });
+}
+
+export function prepareUpstreamInput(input, { upstreamProvider } = {}) {
+  if (!Array.isArray(input)) return input;
+  let working = flattenChatToolCallsToResponses(input);
+  working = normalizeGatewayInput(working);
+  if (upstreamProvider === "kimi") {
+    working = stripAssistantToolCalls(working);
+  }
+  return working;
+}
+
 export function normalizeGatewayInputForModel(input, config, model) {
   if (!Array.isArray(input)) return input;
-  let working = input;
-  if (profileById(providerForModel(config, model))?.flattenChatToolCallsToResponses) {
-    working = flattenChatToolCallsToResponses(working);
-  } else if (profileById(providerForModel(config, model))?.materializeChatToolResults) {
-    working = materializeChatToolResults(working);
-  }
-  return normalizeGatewayInput(working);
+  const provider = providerForModel(config, model);
+  return prepareUpstreamInput(input, { upstreamProvider: provider });
 }
 
 export function normalizeGatewayInput(input) {
@@ -2092,14 +2120,18 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     reason: "compact_summarize",
     directVision: false,
   };
-  const compactProfile = profileById(providerForModel(config, route.model));
+  const target = upstreamTargetFor(config, route.model);
+  const compactProfile = profileById(target.provider);
   const summarizeBody = {
     ...payload,
     model: route.model,
     stream: false,
     tools: [],
     input: [
-      ...rewriteHistoricalImages(normalizeGatewayInputForModel(payload.input, config, route.model), mediaStore, {
+      ...rewriteHistoricalImages(
+        prepareUpstreamInput(payload.input, { upstreamProvider: target.provider }),
+        mediaStore,
+        {
         preserveCurrentImages: false,
       }),
       messageItem(COMPACT_PROMPT),
@@ -2118,7 +2150,6 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
   delete summarizeBody.conversation;
   const bytesIn = Buffer.byteLength(JSON.stringify(payload));
 
-  const target = upstreamTargetFor(config, route.model);
   const upstreamModel = target.model;
   const operation = v2 ? "compact_v2" : "compact_v1";
   const finish = metrics?.begin?.("responses", {
@@ -2369,10 +2400,13 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
   // its byte-stable history is never touched.
   const proOpenCodeGo =
     bareModelId(route.model) === "deepseek-v4-pro" && providerForModel(config, route.model) === "opencode-go";
+  const target = upstreamTargetFor(config, route.model);
   const normalizedPayload = {
     ...payload,
     input: rewriteHistoricalImages(
-      proOpenCodeGo ? normalizeOpenCodeProInput(payload.input) : normalizeGatewayInputForModel(payload.input, config, route.model),
+      proOpenCodeGo
+        ? normalizeOpenCodeProInput(payload.input)
+        : prepareUpstreamInput(payload.input, { upstreamProvider: target.provider }),
       mediaStore,
       // Same rule as the compaction path: keep the real image whenever the model
       // receiving it can read it - on the escalation path, and also when a
@@ -2416,10 +2450,7 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
   const imageShape = modelEntryFor(config, normalizedPayload.model)?.imageUrlShape;
   if (imageShape) normalizedPayload.input = adaptImageUrlShape(normalizedPayload.input, imageShape);
 
-  const target = upstreamTargetFor(config, normalizedPayload.model);
-  // The upstream sees the bare model id; the route model (possibly owner-suffixed)
-  // stays in the response and affinity so provider resolution keeps working on
-  // continuation requests.
+  // target was resolved above for input normalization; reuse it for the upstream call.
   const upstreamModel = target.model;
   if (config.debug?.dumpAll && config.debug?.dumpDir) {
     dumpRequestBody(config.debug.dumpDir, { ...normalizedPayload, model: upstreamModel });
@@ -2609,6 +2640,12 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
       // innermost message, and classify quota exhaustion before the status
       // mapping so a quota 429 does not read as "retry shortly".
       const translated = translateUpstreamError({ provider: target.provider, status: upstream.status, bodyText: redactBearer(raw), free: target.free });
+      if (target.provider === "kimi" && upstream.status >= 400) {
+        writeRelayFailureReport(compactFailureReport(
+          { ...normalizedPayload, model: upstreamModel },
+          { status: upstream.status, upstreamError: translated.body.error.message },
+        ));
+      }
       const body = JSON.stringify(translated.body);
       if (!res.headersSent) {
         res.statusCode = upstream.status;

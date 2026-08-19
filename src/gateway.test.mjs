@@ -18,6 +18,7 @@ import {
   isCompactV1Request,
   isCompactV2Request,
   isNativeModel,
+  prepareUpstreamInput,
   flattenChatToolCallsToResponses,
   materializeChatToolResults,
   nativeTarget,
@@ -439,6 +440,19 @@ test("dropUnpairedToolItems keeps paired calls and drops both orphan sides", () 
   ];
   const out = dropUnpairedToolItems(input);
   assert.deepEqual(out.map((item) => item.call_id ?? item.type), ["a", "a", "b", "b", "message"]);
+});
+
+test("prepareUpstreamInput strips assistant tool_calls before Kimi upstream relay", () => {
+  const input = [
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "run" }],
+      tool_calls: [{ id: "exec_command:4", type: "function", function: { name: "exec_command", arguments: "{}" } }],
+    },
+  ];
+  const out = prepareUpstreamInput(input, { upstreamProvider: "kimi" });
+  assert.equal(out[0].tool_calls, undefined);
 });
 
 test("flattenChatToolCallsToResponses converts chat tool turns into Responses pairs", () => {
