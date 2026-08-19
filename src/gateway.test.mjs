@@ -18,9 +18,11 @@ import {
   isCompactV1Request,
   isCompactV2Request,
   isNativeModel,
+  materializeChatToolResults,
   nativeTarget,
   normalizeNativeInput,
   normalizeGatewayInput,
+  normalizeGatewayInputForModel,
   normalizeOpenCodeProInput,
   pipeGatewayStream,
   pipeNormalizedStream,
@@ -436,6 +438,60 @@ test("dropUnpairedToolItems keeps paired calls and drops both orphan sides", () 
   ];
   const out = dropUnpairedToolItems(input);
   assert.deepEqual(out.map((item) => item.call_id ?? item.type), ["a", "a", "b", "b", "message"]);
+});
+
+test("materializeChatToolResults promotes Responses tool outputs into chat tool rows", () => {
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "run" }] },
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "executing" }],
+      tool_calls: [
+        { id: "exec_command:4", type: "function", function: { name: "exec_command", arguments: "{}" } },
+        { id: "exec_command:5", type: "function", function: { name: "exec_command", arguments: "{}" } },
+      ],
+    },
+    { type: "function_call_output", call_id: "exec_command:4", output: "out4" },
+    { type: "function_call_output", call_id: "exec_command:5", output: "out5" },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+  ];
+  const out = materializeChatToolResults(input);
+  assert.deepEqual(out.map((item) => item.role ?? item.type), [
+    "user",
+    "assistant",
+    "tool",
+    "tool",
+    "user",
+  ]);
+  assert.equal(out[2].tool_call_id, "exec_command:4");
+  assert.equal(out[3].tool_call_id, "exec_command:5");
+  assert.ok(!out.some((item) => item.type === "function_call_output"), "Responses outputs are consumed once chat rows exist");
+});
+
+test("normalizeGatewayInputForModel strips orphan chat tool_calls for Kimi after materialization", () => {
+  const config = {
+    ...configStub(),
+    tokens: { "opencode-go": "go-token", kimi: "kimi-token" },
+  };
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "run" }] },
+    {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "executing" }],
+      tool_calls: [
+        { id: "exec_command:4", type: "function", function: { name: "exec_command", arguments: "{}" } },
+        { id: "exec_command:5", type: "function", function: { name: "exec_command", arguments: "{}" } },
+        { id: "exec_command:6", type: "function", function: { name: "exec_command", arguments: "{}" } },
+      ],
+    },
+    { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
+  ];
+  const normalized = normalizeGatewayInputForModel(input, config, "k3@kimi");
+  assert.equal(normalized.length, 3);
+  assert.equal(normalized[1].role, "assistant");
+  assert.equal(normalized[1].tool_calls, undefined, "orphaned chat tool_calls must not reach Kimi");
 });
 
 test("dropUnpairedToolItems pairs the chat shape (message.tool_calls + role:tool) too", () => {
