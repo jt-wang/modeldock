@@ -379,6 +379,10 @@ const KIMI_PROFILE = {
   label: "Kimi Code",
   baseUrl: "https://api.kimi.com/coding/v1",
   tokenEnvName: "KIMI_API_KEY",
+  // Kimi's /coding/v1 Responses endpoint rejects tool_choice:"none" with 400
+  // "Invalid request Error" even when tools is empty. tools:[] alone is enough
+  // to keep the compact summarize call tool-free.
+  supportsToolChoiceNone: false,
 
   blockedToolTypes: new Set([]),
   hiddenToolNames: new Set([]),
