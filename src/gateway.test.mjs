@@ -2524,6 +2524,56 @@ test("relayResponses counts the request body bytes as transfer-in", async () => 
   }
 });
 
+test("relayCompaction omits tool_choice none for Kimi compact summarize", async () => {
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return summaryResponse("kimi compact ok");
+  };
+  try {
+    const result = await relayCompaction(
+      {
+        model: "k3@kimi",
+        stream: false,
+        store: true,
+        prompt_cache_key: "pk_test",
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+          { type: "reasoning", id: "rs1", content: [{ type: "reasoning_text", text: "thinking" }] },
+          { type: "function_call", call_id: "call1", name: "shell", arguments: "{}" },
+          { type: "function_call_output", call_id: "call1", output: "ok" },
+          { type: "compaction_trigger" },
+        ],
+      },
+      res,
+      {
+        ...compactServices(),
+        config: {
+          ...configStub(),
+          tokens: { "opencode-go": "go-token", kimi: "kimi-token" },
+        },
+        knownModels: new Set(["k3@kimi"]),
+        mainModel: "k3@kimi",
+      },
+      {},
+      true,
+    );
+    assert.equal(result.ok, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://api.kimi.com/coding/v1/responses");
+    assert.equal(calls[0].body.model, "k3");
+    assert.deepEqual(calls[0].body.tools, []);
+    assert.equal(calls[0].body.tool_choice, undefined, "Kimi rejects tool_choice:none with 400");
+    assert.equal(calls[0].body.store, undefined);
+    assert.equal(calls[0].body.prompt_cache_key, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("relayCompaction reports the failure telemetry when the upstream rejects the summarize call", async () => {
   const sink = collectStream();
   const res = responseStub(sink);

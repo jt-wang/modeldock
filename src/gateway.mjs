@@ -1955,12 +1955,12 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     reason: "compact_summarize",
     directVision: false,
   };
+  const compactProfile = profileById(providerForModel(config, route.model));
   const summarizeBody = {
     ...payload,
     model: route.model,
     stream: false,
     tools: [],
-    tool_choice: "none",
     input: [
       ...rewriteHistoricalImages(normalizeGatewayInput(payload.input), mediaStore, {
         preserveCurrentImages: false,
@@ -1968,8 +1968,17 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
       messageItem(COMPACT_PROMPT),
     ],
   };
+  if (compactProfile?.supportsToolChoiceNone !== false) {
+    summarizeBody.tool_choice = "none";
+  }
+  if (modelEntryFor(config, route.model)?.reasoningEffortSupported === false) {
+    delete summarizeBody.reasoning;
+  }
   delete summarizeBody.previous_response_id;
   delete summarizeBody.client_metadata;
+  delete summarizeBody.store;
+  delete summarizeBody.prompt_cache_key;
+  delete summarizeBody.conversation;
   const bytesIn = Buffer.byteLength(JSON.stringify(payload));
 
   const target = upstreamTargetFor(config, route.model);
