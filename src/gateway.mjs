@@ -412,6 +412,83 @@ function isToolOutputItem(item) {
   return item?.type === "function_call_output" || item?.type === "custom_tool_call_output";
 }
 
+function chatToolCallId(call) {
+  if (!call || typeof call !== "object") return undefined;
+  const id = call.id ?? call.call_id;
+  return typeof id === "string" && id ? id : undefined;
+}
+
+function chatToolResultText(item) {
+  if (typeof item?.output === "string") return item.output;
+  if (item?.output !== undefined) return JSON.stringify(item.output);
+  if (typeof item?.content === "string") return item.content;
+  if (Array.isArray(item?.content)) {
+    return item.content
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+// Kimi's Responses translator validates chat-style tool history: each
+// assistant.tool_calls entry must be followed by role:"tool" rows. Codex often
+// keeps the results only as top-level function_call_output items, which
+// dropUnpairedToolItems treats as paired even though Kimi cannot see them.
+export function materializeChatToolResults(input) {
+  if (!Array.isArray(input)) return input;
+  const responseOutputById = new Map();
+  const chatToolById = new Map();
+  for (const item of input) {
+    if (isToolOutputItem(item) && typeof item.call_id === "string" && item.call_id) {
+      if (!responseOutputById.has(item.call_id)) responseOutputById.set(item.call_id, item);
+    }
+    if (item?.type === "message" && item?.role === "tool" && typeof item.tool_call_id === "string" && item.tool_call_id) {
+      if (!chatToolById.has(item.tool_call_id)) chatToolById.set(item.tool_call_id, item);
+    }
+  }
+  const consumedResponseOutputs = new Set();
+  const emittedChatToolIds = new Set();
+  const out = [];
+  for (const item of input) {
+    if (isToolOutputItem(item)) {
+      if (consumedResponseOutputs.has(item.call_id)) continue;
+      out.push(item);
+      continue;
+    }
+    if (item?.type === "message" && item?.role === "tool") {
+      if (emittedChatToolIds.has(item.tool_call_id)) continue;
+      out.push(item);
+      emittedChatToolIds.add(item.tool_call_id);
+      continue;
+    }
+    out.push(item);
+    if (item?.type !== "message" || item?.role !== "assistant" || !Array.isArray(item.tool_calls) || !item.tool_calls.length) {
+      continue;
+    }
+    for (const call of item.tool_calls) {
+      const id = chatToolCallId(call);
+      if (!id || emittedChatToolIds.has(id)) continue;
+      const existing = chatToolById.get(id);
+      if (existing) {
+        out.push(existing);
+        emittedChatToolIds.add(id);
+        continue;
+      }
+      const source = responseOutputById.get(id);
+      if (!source) continue;
+      out.push({
+        type: "message",
+        role: "tool",
+        tool_call_id: id,
+        content: chatToolResultText(source),
+      });
+      consumedResponseOutputs.add(id);
+      emittedChatToolIds.add(id);
+    }
+  }
+  return out;
+}
+
 // Go (Console Go) validates tool pairing strictly and rejects the whole request
 // when a tool call has no matching output ("No tool output found for tool call
 // ..."). Codex genuinely produces such orphans - a remote compact task slices
@@ -424,24 +501,25 @@ function isToolOutputItem(item) {
 export function dropUnpairedToolItems(input) {
   if (!Array.isArray(input)) return input;
   const callIds = new Set();
-  const outputIds = new Set();
+  const responseOutputIds = new Set();
+  const chatToolResultIds = new Set();
   for (const item of input) {
     if (isToolCallItem(item)) callIds.add(item.call_id);
-    if (isToolOutputItem(item)) outputIds.add(item.call_id);
+    if (isToolOutputItem(item)) responseOutputIds.add(item.call_id);
     if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item.tool_calls)) {
       for (const call of item.tool_calls) {
-        const id = typeof call === "object" && call !== null ? (call.id ?? call.call_id) : undefined;
-        if (typeof id === "string" && id) callIds.add(id);
+        const id = chatToolCallId(call);
+        if (id) callIds.add(id);
       }
     }
     if (item?.type === "message" && item?.role === "tool" && typeof item.tool_call_id === "string" && item.tool_call_id) {
-      outputIds.add(item.tool_call_id);
+      chatToolResultIds.add(item.tool_call_id);
     }
   }
   const paired = input
     .map((item) => {
       if (isToolCallItem(item)) {
-        return outputIds.has(item.call_id) ? item : null;
+        return responseOutputIds.has(item.call_id) ? item : null;
       }
       if (isToolOutputItem(item)) {
         return callIds.has(item.call_id) ? item : null;
@@ -450,10 +528,7 @@ export function dropUnpairedToolItems(input) {
         return callIds.has(item.tool_call_id) ? item : null;
       }
       if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item.tool_calls)) {
-        const kept = item.tool_calls.filter((call) => {
-          const id = typeof call === "object" && call !== null ? (call.id ?? call.call_id) : undefined;
-          return outputIds.has(id);
-        });
+        const kept = item.tool_calls.filter((call) => chatToolResultIds.has(chatToolCallId(call)));
         if (kept.length === item.tool_calls.length) return item;
         // A message whose calls all got severed and that carries no other text
         // would reach the upstream as an empty assistant turn, which strict
@@ -681,6 +756,15 @@ function attachProExecutionGuidance(input) {
   const out = [...input];
   out[index] = { ...message, content };
   return out;
+}
+
+export function normalizeGatewayInputForModel(input, config, model) {
+  if (!Array.isArray(input)) return input;
+  let working = input;
+  if (profileById(providerForModel(config, model))?.materializeChatToolResults) {
+    working = materializeChatToolResults(working);
+  }
+  return normalizeGatewayInput(working);
 }
 
 export function normalizeGatewayInput(input) {
@@ -1962,7 +2046,7 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     stream: false,
     tools: [],
     input: [
-      ...rewriteHistoricalImages(normalizeGatewayInput(payload.input), mediaStore, {
+      ...rewriteHistoricalImages(normalizeGatewayInputForModel(payload.input, config, route.model), mediaStore, {
         preserveCurrentImages: false,
       }),
       messageItem(COMPACT_PROMPT),
@@ -2235,7 +2319,7 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
   const normalizedPayload = {
     ...payload,
     input: rewriteHistoricalImages(
-      proOpenCodeGo ? normalizeOpenCodeProInput(payload.input) : normalizeGatewayInput(payload.input),
+      proOpenCodeGo ? normalizeOpenCodeProInput(payload.input) : normalizeGatewayInputForModel(payload.input, config, route.model),
       mediaStore,
       // Same rule as the compaction path: keep the real image whenever the model
       // receiving it can read it - on the escalation path, and also when a
