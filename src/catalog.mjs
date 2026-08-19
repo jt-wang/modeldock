@@ -72,7 +72,7 @@ export function catalogFor(config) {
       && !(modelEntry?.endpoint === "chat" || modelEntry?.status === "unavailable");
   });
   // The detected Codex version is whatever captured the native cache; absent or
-  // unparseable, allowedEffortsFor withholds `max`. Every return below routes
+  // unparseable, allowedEffortsFor withholds `max`/`ultra`. Every return below
   // through publish() so no path can emit an effort the client cannot parse -
   // the early returns are where `max` leaked past the old native-only filter.
   const allowed = allowedEffortsFor(readNativeCatalog(config)?.captured_with);
@@ -131,15 +131,18 @@ const BASE_REASONING_LEVELS = ["none", "minimal", "low", "medium", "high", "xhig
 // catch-all whose only rejection is the empty string) and parses `max` happily.
 const MAX_EFFORT_MIN_VERSION = "0.138.0";
 
-// `ultra` is a backend rejection rather than a client one, so it is dropped at
-// every version. Measured 2026-08-17 against chatgpt.com/backend-api/codex with
-// gpt-5.6-sol: "Invalid value: 'ultra'. Supported values are: 'none', 'minimal',
-// 'low', 'medium', 'high', 'xhigh', and 'max'." Since 0.138+ parse it happily
-// and only the request 400s, this filter is the sole protection - and the
-// bundled catalogs of 0.144/0.145 do advertise `ultra` on gpt-5.6-sol/-terra.
+// `ultra` is newer than `max`: 0.138+ parse both (open enum), but bundled native
+// catalogs only started advertising `ultra` around 0.144/0.145, and the backend
+// briefly rejected it before 2026-08-19 (measured 2026-08-17 against gpt-5.6-sol).
+// Gate it separately so 0.138-0.143 clients keep `max` without a picker rung that
+// older stacks may still 400 on. Curated/routed models never invent `ultra`; only
+// native entries that already carry it can publish it once the capture is new enough.
+const ULTRA_EFFORT_MIN_VERSION = "0.144.0";
+
 export function allowedEffortsFor(codexVersion) {
   const levels = new Set(BASE_REASONING_LEVELS);
   if (versionAtLeast(codexVersion, MAX_EFFORT_MIN_VERSION)) levels.add("max");
+  if (versionAtLeast(codexVersion, ULTRA_EFFORT_MIN_VERSION)) levels.add("ultra");
   return levels;
 }
 

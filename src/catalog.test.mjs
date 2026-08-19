@@ -348,21 +348,32 @@ test("mergeNativeCatalog fills in the field older parsers require on every entry
   }
 });
 
-test("a current Codex keeps `max` and still loses `ultra`", () => {
-  // Measured 2026-08-17 against chatgpt.com/backend-api/codex with gpt-5.6-sol:
-  //   max   -> 200, and spends MORE reasoning than xhigh (39 vs 35 reasoning_tokens)
-  //   ultra -> 400 "Invalid value: 'ultra'. Supported values are: 'none',
-  //            'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'."
-  // 0.138+ parse `ultra` happily, so nothing but this filter stops the 400.
+test("a current Codex keeps native `max` and `ultra` when captured at 0.144+", () => {
+  // Re-verified 2026-08-19: gpt-5.6-sol accepts both max and ultra on the live
+  // backend. Bundled native catalogs from 0.144/0.145 advertise ultra on Sol/Terra,
+  // so we publish it only when captured_with says the client is new enough.
   const catalog = catalogWithCodex("0.145.0");
   const entry = catalog.models.find((model) => model.slug === "gpt-5.6-sol");
   assert.ok(entry, "native entry is published");
   assert.deepEqual(
     entry.supported_reasoning_levels.map((level) => level.effort),
-    ["low", "high", "max"],
-    "ultra is rejected upstream and dropped; max is accepted and kept",
+    ["low", "high", "max", "ultra"],
+    "native ultra survives on a current capture; curated models never invent it",
   );
   assert.equal(entry.default_reasoning_level, "max", "an accepted default survives untouched");
+});
+
+test("0.138 through 0.143 keeps `max` but withholds `ultra`", () => {
+  // 0.138+ parse ultra happily, but bundled catalogs did not advertise it until
+  // ~0.144 and the backend briefly rejected it (measured 2026-08-17). Withholding
+  // ultra on these builds avoids picker rungs that older stacks may still 400.
+  for (const version of ["0.138.0", "0.140.0", "0.143.9"]) {
+    const entry = catalogWithCodex(version).models.find((model) => model.slug === "gpt-5.6-sol");
+    assert.ok(entry, `native entry is published for ${version}`);
+    const efforts = entry.supported_reasoning_levels.map((level) => level.effort);
+    assert.ok(efforts.includes("max"), `${version} keeps max`);
+    assert.ok(!efforts.includes("ultra"), `${version} withholds ultra`);
+  }
 });
 test("catalogFor groups models by provider label with sequential priorities", () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), "modeldock-native-test-"));
@@ -470,7 +481,7 @@ test("a pre-0.138 Codex gets no `max` anywhere, curated entries included", () =>
   const catalog = catalogWithCodex("0.130.0");
   const efforts = effortsIn(catalog);
   assert.ok(!efforts.has("max"), "one `max` anywhere aborts the whole parse on 0.130");
-  assert.ok(!efforts.has("ultra"), "ultra is rejected by both the old client and the backend");
+  assert.ok(!efforts.has("ultra"), "ultra is withheld until 0.144 and never invented for curated models");
   assert.ok(efforts.has("xhigh") || efforts.has("high"), "the surviving ladder is not empty");
   const curated = catalog.models.filter((m) => m.minimal_client_version);
   assert.ok(curated.length > 0, "there are curated entries to check");
@@ -511,15 +522,19 @@ test("a default_reasoning_level that gets filtered away clamps to a surviving ru
   }
 });
 
-test("allowedEffortsFor drops ultra at every version", () => {
-  // ultra is a backend rejection, not a client one: 0.138+ parse it happily and
-  // then the request 400s. Measured 2026-08-17 against the ChatGPT backend.
-  for (const version of ["0.130.0", "0.138.0", "0.145.0", "1.0.0"]) {
-    assert.ok(!allowedEffortsFor(version).has("ultra"), `ultra must never survive (${version})`);
-  }
-  assert.ok(allowedEffortsFor("0.138.0").has("max"));
+test("allowedEffortsFor gates max at 0.138 and ultra at 0.144", () => {
   assert.ok(!allowedEffortsFor("0.137.9").has("max"));
+  assert.ok(!allowedEffortsFor("0.137.9").has("ultra"));
   assert.ok(!allowedEffortsFor("0.138.0-alpha.1").has("max"), "a prerelease sorts below its release");
+
+  assert.ok(allowedEffortsFor("0.138.0").has("max"));
+  assert.ok(!allowedEffortsFor("0.138.0").has("ultra"));
+  assert.ok(!allowedEffortsFor("0.143.9").has("ultra"));
+
+  assert.ok(allowedEffortsFor("0.144.0").has("max"));
+  assert.ok(allowedEffortsFor("0.144.0").has("ultra"));
+  assert.ok(allowedEffortsFor("0.145.0").has("ultra"));
+  assert.ok(allowedEffortsFor("1.0.0").has("ultra"));
 });
 
 test("the effort gate covers trial mode and the native-merge opt-out", () => {
