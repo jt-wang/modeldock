@@ -758,10 +758,63 @@ function attachProExecutionGuidance(input) {
   return out;
 }
 
+// Kimi's Responses translator validates chat-style tool history strictly.
+// Codex frequently replays tool turns as assistant.tool_calls plus either
+// role:"tool" rows or top-level function_call_output items. Flatten those
+// turns into Responses function_call/output pairs and drop orphan calls.
+export function flattenChatToolCallsToResponses(input) {
+  if (!Array.isArray(input)) return input;
+  const outputByCallId = new Map();
+  for (const item of input) {
+    if (isToolOutputItem(item) && typeof item.call_id === "string" && item.call_id) {
+      outputByCallId.set(item.call_id, item);
+    }
+    if (item?.type === "message" && item?.role === "tool" && typeof item.tool_call_id === "string" && item.tool_call_id) {
+      outputByCallId.set(item.tool_call_id, item);
+    }
+  }
+  const consumedOutputs = new Set();
+  const out = [];
+  for (const item of input) {
+    if (item?.type === "message" && item?.role === "tool") continue;
+    if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length) {
+      const { tool_calls, ...assistant } = item;
+      out.push(assistant);
+      for (const call of tool_calls) {
+        const id = chatToolCallId(call);
+        const source = id ? outputByCallId.get(id) : undefined;
+        if (!id || !source) continue;
+        out.push({
+          type: "function_call",
+          call_id: id,
+          name: call?.function?.name || call?.name || "function",
+          arguments: call?.function?.arguments || call?.arguments || "{}",
+        });
+        out.push({
+          type: "function_call_output",
+          call_id: id,
+          output: chatToolResultText(source),
+        });
+        consumedOutputs.add(id);
+      }
+      continue;
+    }
+    if (isToolOutputItem(item)) {
+      if (consumedOutputs.has(item.call_id)) continue;
+      out.push(item);
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
 export function normalizeGatewayInputForModel(input, config, model) {
   if (!Array.isArray(input)) return input;
   let working = input;
-  if (profileById(providerForModel(config, model))?.materializeChatToolResults) {
+  if (profileById(providerForModel(config, model))?.flattenChatToolCallsToResponses) {
+    working = flattenChatToolCallsToResponses(working);
+  } else if (profileById(providerForModel(config, model))?.materializeChatToolResults) {
     working = materializeChatToolResults(working);
   }
   return normalizeGatewayInput(working);

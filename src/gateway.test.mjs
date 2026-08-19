@@ -18,6 +18,7 @@ import {
   isCompactV1Request,
   isCompactV2Request,
   isNativeModel,
+  flattenChatToolCallsToResponses,
   materializeChatToolResults,
   nativeTarget,
   normalizeNativeInput,
@@ -440,7 +441,7 @@ test("dropUnpairedToolItems keeps paired calls and drops both orphan sides", () 
   assert.deepEqual(out.map((item) => item.call_id ?? item.type), ["a", "a", "b", "b", "message"]);
 });
 
-test("materializeChatToolResults promotes Responses tool outputs into chat tool rows", () => {
+test("flattenChatToolCallsToResponses converts chat tool turns into Responses pairs", () => {
   const input = [
     { type: "message", role: "user", content: [{ type: "input_text", text: "run" }] },
     {
@@ -456,20 +457,20 @@ test("materializeChatToolResults promotes Responses tool outputs into chat tool 
     { type: "function_call_output", call_id: "exec_command:5", output: "out5" },
     { type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] },
   ];
-  const out = materializeChatToolResults(input);
-  assert.deepEqual(out.map((item) => item.role ?? item.type), [
+  const out = flattenChatToolCallsToResponses(input);
+  assert.deepEqual(out.map((item) => item.call_id ?? item.role ?? item.type), [
     "user",
     "assistant",
-    "tool",
-    "tool",
+    "exec_command:4",
+    "exec_command:4",
+    "exec_command:5",
+    "exec_command:5",
     "user",
   ]);
-  assert.equal(out[2].tool_call_id, "exec_command:4");
-  assert.equal(out[3].tool_call_id, "exec_command:5");
-  assert.ok(!out.some((item) => item.type === "function_call_output"), "Responses outputs are consumed once chat rows exist");
+  assert.equal(out[1].tool_calls, undefined);
 });
 
-test("normalizeGatewayInputForModel strips orphan chat tool_calls for Kimi after materialization", () => {
+test("normalizeGatewayInputForModel strips orphan chat tool_calls for Kimi after flattening", () => {
   const config = {
     ...configStub(),
     tokens: { "opencode-go": "go-token", kimi: "kimi-token" },

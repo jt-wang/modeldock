@@ -383,10 +383,11 @@ const KIMI_PROFILE = {
   // "Invalid request Error" even when tools is empty. tools:[] alone is enough
   // to keep the compact summarize call tool-free.
   supportsToolChoiceNone: false,
-  // Kimi translates Responses history to chat messages and requires each
-  // assistant.tool_calls row to be followed by role:"tool" messages. Codex
-  // often stores the results only as top-level function_call_output items.
-  materializeChatToolResults: true,
+  // Kimi translates Responses history to chat messages and rejects assistant
+  // tool_calls unless every call has an adjacent role:"tool" row. Codex often
+  // stores results as top-level function_call_output instead. Flatten chat tool
+  // turns into Responses function_call/output pairs before relay.
+  flattenChatToolCallsToResponses: true,
 
   blockedToolTypes: new Set([]),
   hiddenToolNames: new Set([]),
