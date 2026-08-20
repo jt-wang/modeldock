@@ -424,6 +424,69 @@ function isToolOutputItem(item) {
   return item?.type === "function_call_output" || item?.type === "custom_tool_call_output";
 }
 
+// Codex reuses short call_ids across turns (exec_command_0, exec_command_1, …).
+// Pairing helpers keyed by call_id then keep every call but only the first output
+// per id, so later turns reach Kimi as unpaired assistant.tool_calls and fail
+// with "exec_command:4/5/6 did not have response messages". Rewrite reused ids
+// in FIFO order so each call/output pair stays unique for the whole history.
+export function uniquifyReusedToolCallIds(input) {
+  if (!Array.isArray(input)) return input;
+  const callCounts = new Map();
+  const pendingByOriginal = new Map();
+  let changed = false;
+  const out = [];
+  for (const item of input) {
+    if (isToolCallItem(item) && typeof item.call_id === "string" && item.call_id) {
+      const original = item.call_id;
+      const n = (callCounts.get(original) || 0) + 1;
+      callCounts.set(original, n);
+      const unique = n === 1 ? original : `${original}__${n}`;
+      if (unique !== original) changed = true;
+      if (!pendingByOriginal.has(original)) pendingByOriginal.set(original, []);
+      pendingByOriginal.get(original).push(unique);
+      out.push(unique === item.call_id ? item : { ...item, call_id: unique });
+      continue;
+    }
+    if (isToolOutputItem(item) && typeof item.call_id === "string" && item.call_id) {
+      const queue = pendingByOriginal.get(item.call_id);
+      const unique = queue?.length ? queue.shift() : item.call_id;
+      if (unique !== item.call_id) changed = true;
+      out.push(unique === item.call_id ? item : { ...item, call_id: unique });
+      continue;
+    }
+    if (item?.type === "message" && item?.role === "assistant" && Array.isArray(item.tool_calls) && item.tool_calls.length) {
+      let toolChanged = false;
+      const tool_calls = item.tool_calls.map((call) => {
+        const original = chatToolCallId(call);
+        if (!original) return call;
+        const n = (callCounts.get(original) || 0) + 1;
+        callCounts.set(original, n);
+        const unique = n === 1 ? original : `${original}__${n}`;
+        if (unique !== original) {
+          toolChanged = true;
+          changed = true;
+        }
+        if (!pendingByOriginal.has(original)) pendingByOriginal.set(original, []);
+        pendingByOriginal.get(original).push(unique);
+        if (unique === original) return call;
+        if (call.id !== undefined) return { ...call, id: unique };
+        return { ...call, call_id: unique };
+      });
+      out.push(toolChanged ? { ...item, tool_calls } : item);
+      continue;
+    }
+    if (item?.type === "message" && item?.role === "tool" && typeof item.tool_call_id === "string" && item.tool_call_id) {
+      const queue = pendingByOriginal.get(item.tool_call_id);
+      const unique = queue?.length ? queue.shift() : item.tool_call_id;
+      if (unique !== item.tool_call_id) changed = true;
+      out.push(unique === item.tool_call_id ? item : { ...item, tool_call_id: unique });
+      continue;
+    }
+    out.push(item);
+  }
+  return changed ? out : input;
+}
+
 function chatToolCallId(call) {
   if (!call || typeof call !== "object") return undefined;
   const id = call.id ?? call.call_id;
@@ -834,7 +897,8 @@ function stripAssistantToolCalls(input) {
 
 export function prepareUpstreamInput(input, { upstreamProvider } = {}) {
   if (!Array.isArray(input)) return input;
-  let working = flattenChatToolCallsToResponses(input);
+  let working = uniquifyReusedToolCallIds(input);
+  working = flattenChatToolCallsToResponses(working);
   working = normalizeGatewayInput(working);
   if (upstreamProvider === "kimi") {
     working = stripAssistantToolCalls(working);
@@ -850,7 +914,7 @@ export function normalizeGatewayInputForModel(input, config, model) {
 
 export function normalizeGatewayInput(input) {
   if (!Array.isArray(input)) return input;
-  const rewritten = dropUnpairedToolItems(input)
+  const rewritten = dropUnpairedToolItems(uniquifyReusedToolCallIds(input))
     .filter((item) => item?.type !== "compaction_trigger")
     .map((item) => {
       if (item?.type !== "compaction") return item;
