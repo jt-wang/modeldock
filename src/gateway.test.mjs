@@ -21,6 +21,7 @@ import {
   prepareUpstreamInput,
   flattenChatToolCallsToResponses,
   materializeChatToolResults,
+  uniquifyReusedToolCallIds,
   nativeTarget,
   normalizeNativeInput,
   normalizeGatewayInput,
@@ -440,6 +441,50 @@ test("dropUnpairedToolItems keeps paired calls and drops both orphan sides", () 
   ];
   const out = dropUnpairedToolItems(input);
   assert.deepEqual(out.map((item) => item.call_id ?? item.type), ["a", "a", "b", "b", "message"]);
+});
+
+test("uniquifyReusedToolCallIds keeps later turns when Codex reuses call_ids", () => {
+  const input = [
+    { type: "function_call", call_id: "exec_command_0", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "exec_command_0", output: "first" },
+    { type: "function_call", call_id: "exec_command_0", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "exec_command_0", output: "second" },
+    { type: "function_call", call_id: "exec_command_0", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "exec_command_0", output: "third" },
+  ];
+  const unique = uniquifyReusedToolCallIds(input);
+  assert.deepEqual(unique.map((item) => item.call_id), [
+    "exec_command_0",
+    "exec_command_0",
+    "exec_command_0__2",
+    "exec_command_0__2",
+    "exec_command_0__3",
+    "exec_command_0__3",
+  ]);
+  const normalized = normalizeGatewayInput(input);
+  assert.equal(normalized.filter((item) => item.type === "function_call").length, 3);
+  assert.equal(normalized.filter((item) => item.type === "function_call_output").length, 3);
+});
+
+test("prepareUpstreamInput preserves reused Codex exec_command turns for Kimi", () => {
+  const input = [
+    { type: "message", role: "user", content: [{ type: "input_text", text: "run" }] },
+    { type: "function_call", call_id: "exec_command_0", name: "exec_command", arguments: "{}" },
+    { type: "function_call", call_id: "exec_command_1", name: "exec_command", arguments: "{}" },
+    { type: "function_call", call_id: "exec_command_2", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "exec_command_0", output: "a" },
+    { type: "function_call_output", call_id: "exec_command_1", output: "b" },
+    { type: "function_call_output", call_id: "exec_command_2", output: "c" },
+    { type: "function_call", call_id: "exec_command_0", name: "exec_command", arguments: "{}" },
+    { type: "function_call", call_id: "exec_command_1", name: "exec_command", arguments: "{}" },
+    { type: "function_call", call_id: "exec_command_2", name: "exec_command", arguments: "{}" },
+    { type: "function_call_output", call_id: "exec_command_0", output: "d" },
+    { type: "function_call_output", call_id: "exec_command_1", output: "e" },
+    { type: "function_call_output", call_id: "exec_command_2", output: "f" },
+  ];
+  const prepared = prepareUpstreamInput(input, { upstreamProvider: "kimi" });
+  assert.equal(prepared.filter((item) => item.type === "function_call").length, 6);
+  assert.equal(prepared.filter((item) => item.type === "function_call_output").length, 6);
 });
 
 test("prepareUpstreamInput strips assistant tool_calls before Kimi upstream relay", () => {
