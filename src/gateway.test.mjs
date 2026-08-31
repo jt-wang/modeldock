@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import {
   RouteAffinity,
   applyToolPolicy,
+  compactModelForRelay,
   compactFailureReport,
   createUsageTee,
   currentTurnStartForTesting,
@@ -37,6 +38,7 @@ import {
   rewriteHistoricalImages,
   routeGatewayRequest,
   sessionIdsFrom,
+  syncModelSelectionFromPayload,
   upstreamTargetFor,
   hiddenToolsFor,
   adaptImageUrlShape,
@@ -160,8 +162,23 @@ test("normalizeGatewayInput promotes the live split NEW_TASK agent_message shape
     },
     { type: "message", role: "user", content: [{ type: "input_text", text: "<recommended_plugins>\nCanva\n" }] },
   ]);
-  assert.equal(normalized.at(-1).role, "user");
-  assert.equal(normalized.at(-1).content[0].text, payload);
+  assert.equal(normalized.some((item) => item.type === "agent_message"), false);
+  const users = normalized.filter((item) => item.type === "message" && item.role === "user");
+  assert.equal(users.at(-2).content[0].text, payload);
+});
+
+test("normalizeGatewayInput converts agent_message items for routed upstream replay", () => {
+  const normalized = normalizeGatewayInput([
+    {
+      type: "agent_message",
+      content: [{ type: "input_text", text: "status probe complete" }],
+    },
+  ]);
+  assert.deepEqual(normalized, [{
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "status probe complete" }],
+  }]);
 });
 
 test("compaction summaries round-trip through the kcr1 payload", () => {
@@ -190,6 +207,61 @@ test("compact request detection distinguishes v1 paths and v2 triggers", () => {
   );
   assert.equal(isCompactV2Request({ input: [{ type: "message", role: "user", content: [] }] }), false);
   assert.equal(isCompactV2Request({}), false);
+});
+
+test("syncModelSelectionFromPayload updates modelSelection for compact and chat requests", () => {
+  const knownModels = new Set(["k3@kimi", "deepseek-v4-flash@deepseek-official"]);
+  const modelSelection = { mainModel: "deepseek-v4-flash@deepseek-official", visionModel: "none" };
+  const services = { modelSelection };
+  assert.equal(
+    syncModelSelectionFromPayload(services, { model: "k3@kimi" }, knownModels),
+    "k3@kimi",
+  );
+  assert.equal(modelSelection.mainModel, "k3@kimi");
+});
+
+test("compactModelForRelay follows synced modelSelection.mainModel", () => {
+  const config = {
+    ...configStub(),
+    mainModel: "deepseek-v4-flash@deepseek-official",
+    tokens: { "opencode-go": "go-token", "deepseek-official": "ds-token", kimi: "kimi-token" },
+  };
+  const knownModels = new Set(["glm-5.3@zai", "k3@kimi", "deepseek-v4-flash@deepseek-official", "gpt-5.6-luna@opencode-go", "mimo-v2.5@opencode-go"]);
+  assert.equal(
+    compactModelForRelay({
+      config,
+      knownModels,
+      activeModel: "k3@kimi",
+      requestedModel: "glm-5.3@zai",
+      fallbackModel: "deepseek-v4-flash@deepseek-official",
+    }),
+    "k3@kimi",
+  );
+  assert.equal(
+    compactModelForRelay({
+      config,
+      knownModels,
+      activeModel: "mimo-v2.5@opencode-go",
+      requestedModel: "deepseek-v4-flash@opencode-go",
+      fallbackModel: "deepseek-v4-flash@opencode-go",
+    }),
+    "mimo-v2.5@opencode-go",
+  );
+});
+
+test("compactModelForRelay rejects stale Console Go vision payload.model when active model is unset", () => {
+  const config = configStub();
+  const knownModels = new Set(["deepseek-v4-flash@opencode-go", "gpt-5.6-luna@opencode-go"]);
+  assert.equal(
+    compactModelForRelay({
+      config,
+      knownModels,
+      activeModel: "",
+      requestedModel: "gpt-5.6-luna@opencode-go",
+      fallbackModel: "deepseek-v4-flash@opencode-go",
+    }),
+    "deepseek-v4-flash@opencode-go",
+  );
 });
 
 test("normalizeGatewayInput expands kcr1 compaction items into continuation messages", () => {
@@ -2541,6 +2613,130 @@ test("relayCompaction keeps the main model when recent history still carries an 
       calls[0].input.every((item) => !item.content?.some?.((part) => part.type === "input_image")),
       "compact summarize rewrites images to text refs instead of shipping pixels",
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("relayCompaction follows the active main model instead of Codex's stale payload.model", async () => {
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return summaryResponse("kimi compact ok");
+  };
+  try {
+    const result = await relayCompaction(
+      {
+        model: "glm-5.3@zai",
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "long task" }] },
+          { type: "compaction_trigger" },
+        ],
+      },
+      res,
+      {
+        ...compactServices(),
+        config: {
+          ...configStub(),
+          mainModel: "deepseek-v4-flash@opencode-go",
+          tokens: { "opencode-go": "go-token", zai: "zai-token", kimi: "kimi-token" },
+        },
+        knownModels: new Set(["glm-5.3@zai", "k3@kimi", "deepseek-v4-flash@opencode-go"]),
+        mainModel: "k3@kimi",
+        modelSelection: { mainModel: "k3@kimi", visionModel: "none" },
+      },
+      {},
+      true,
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.route.model, "k3@kimi", "compact must follow the active main model");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://api.kimi.com/coding/v1/responses");
+    assert.equal(calls[0].body.model, "k3");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("relayResponses syncs modelSelection on compact_v2 before summarizing", async () => {
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const calls = [];
+  const modelSelection = { mainModel: "deepseek-v4-flash@deepseek-official", visionModel: "none" };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return summaryResponse("kimi compact ok");
+  };
+  try {
+    const result = await relayResponses(
+      {
+        model: "k3@kimi",
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "long task" }] },
+          { type: "compaction_trigger" },
+        ],
+      },
+      res,
+      {
+        ...compactServices(),
+        config: {
+          ...configStub(),
+          mainModel: "deepseek-v4-flash@deepseek-official",
+          tokens: { "opencode-go": "go-token", "deepseek-official": "ds-token", kimi: "kimi-token" },
+        },
+        knownModels: new Set(["deepseek-v4-flash@deepseek-official", "k3@kimi"]),
+        mainModel: modelSelection.mainModel,
+        modelSelection,
+        requestUrl: "/v1/responses",
+      },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.route.model, "k3@kimi");
+    assert.equal(modelSelection.mainModel, "k3@kimi");
+    assert.equal(calls[0].body.model, "k3");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("relayCompaction ignores a stale Console Go vision payload.model when active main is text-only", async () => {
+  const sink = collectStream();
+  const res = responseStub(sink);
+  const calls = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, body: JSON.parse(options.body) });
+    return summaryResponse("compact ok");
+  };
+  try {
+    const result = await relayCompaction(
+      {
+        model: "gpt-5.6-luna@opencode-go",
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "long task" }] },
+          { type: "compaction_trigger" },
+        ],
+      },
+      res,
+      {
+        ...compactServices(),
+        knownModels: new Set(["deepseek-v4-flash@opencode-go", "gpt-5.6-luna@opencode-go"]),
+        mainModel: "deepseek-v4-flash@opencode-go",
+        visionModel: "gpt-5.6-luna@opencode-go",
+      },
+      {},
+      true,
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.route.model, "deepseek-v4-flash@opencode-go");
+    assert.equal(calls[0].body.model, "deepseek-v4-flash");
   } finally {
     globalThis.fetch = originalFetch;
   }
