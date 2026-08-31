@@ -26,6 +26,7 @@ import {
   nativeTarget,
   normalizeNativeInput,
   normalizeGatewayInput,
+  normalizeMoonshotJsonSchema,
   normalizeGatewayInputForModel,
   normalizeOpenCodeProInput,
   pipeGatewayStream,
@@ -234,6 +235,7 @@ test("compactModelForRelay follows synced modelSelection.mainModel", () => {
       activeModel: "k3@kimi",
       requestedModel: "glm-5.3@zai",
       fallbackModel: "deepseek-v4-flash@deepseek-official",
+      configMainModel: "deepseek-v4-flash@deepseek-official",
     }),
     "k3@kimi",
   );
@@ -244,8 +246,30 @@ test("compactModelForRelay follows synced modelSelection.mainModel", () => {
       activeModel: "mimo-v2.5@opencode-go",
       requestedModel: "deepseek-v4-flash@opencode-go",
       fallbackModel: "deepseek-v4-flash@opencode-go",
+      configMainModel: "deepseek-v4-flash@opencode-go",
     }),
     "mimo-v2.5@opencode-go",
+  );
+});
+
+test("compactModelForRelay follows Codex payload.model after restart when main is still the config default", () => {
+  const config = {
+    ...configStub(),
+    mainModel: "deepseek-v4-flash@deepseek-official",
+    tokens: { "opencode-go": "go-token", "deepseek-official": "ds-token", kimi: "kimi-token" },
+  };
+  const knownModels = new Set(["k3@kimi", "deepseek-v4-flash@deepseek-official"]);
+  assert.equal(
+    compactModelForRelay({
+      config,
+      knownModels,
+      activeModel: "deepseek-v4-flash@deepseek-official",
+      requestedModel: "k3@kimi",
+      fallbackModel: "deepseek-v4-flash@deepseek-official",
+      configMainModel: "deepseek-v4-flash@deepseek-official",
+    }),
+    "k3@kimi",
+    "picker model in payload.model wins before client_selected updates main",
   );
 });
 
@@ -259,6 +283,7 @@ test("compactModelForRelay rejects stale Console Go vision payload.model when ac
       activeModel: "",
       requestedModel: "gpt-5.6-luna@opencode-go",
       fallbackModel: "deepseek-v4-flash@opencode-go",
+      configMainModel: "deepseek-v4-flash@opencode-go",
     }),
     "deepseek-v4-flash@opencode-go",
   );
@@ -872,6 +897,50 @@ test("applyToolPolicy flattens MCP namespaces into qualified functions", () => {
   assert.equal(kept[0].parameters.type, "object");
   assert.equal(stripped.namespaceChildren, 1);
   assert.equal(stripped.hidden, 1);
+});
+
+test("normalizeMoonshotJsonSchema dereferences $defs and drops sibling type on $ref nodes", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      command: { $ref: "#/$defs/__schema20", type: "string" },
+    },
+    required: ["command"],
+    additionalProperties: false,
+    $defs: {
+      __schema20: { type: "string" },
+    },
+  };
+  const normalized = normalizeMoonshotJsonSchema(schema);
+  assert.deepEqual(normalized.properties.command, { type: "string" });
+  assert.equal(normalized.$defs, undefined);
+  assert.equal(normalized.properties.command.$ref, undefined);
+});
+
+test("applyToolPolicy normalizes Moonshot-incompatible MCP schemas for Kimi", () => {
+  const tools = [{
+    type: "namespace",
+    name: "mcp__github",
+    tools: [{
+      type: "function",
+      name: "create_issue",
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { $ref: "#/$defs/__schema20", type: "string" },
+        },
+        required: ["title"],
+        additionalProperties: false,
+        $defs: { __schema20: { type: "string" } },
+      },
+    }],
+  }];
+  const plain = applyToolPolicy(tools);
+  assert.equal(plain.tools[0].parameters.properties.title.$ref, "#/$defs/__schema20");
+  const { tools: kept } = applyToolPolicy(tools, { moonshotSchema: true });
+  assert.equal(kept[0].name, "mcp__github__create_issue");
+  assert.deepEqual(kept[0].parameters.properties.title, { type: "string" });
+  assert.equal(kept[0].parameters.$defs, undefined);
 });
 
 test("applyToolPolicy maps inputSchema to parameters for upstream compatibility", () => {

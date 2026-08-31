@@ -367,15 +367,19 @@ export function syncModelSelectionFromPayload(services, payload, knownModels) {
   return requested;
 }
 
-export function compactModelForRelay({ config, knownModels, activeModel, requestedModel, fallbackModel }) {
-  const active = activeModel && knownModels?.has(activeModel) ? activeModel : "";
+export function compactModelForRelay({ config, knownModels, activeModel, requestedModel, fallbackModel, configMainModel }) {
   const requested = requestedModel && knownModels?.has(requestedModel) ? requestedModel : "";
-  if (active) return active;
+  const active = activeModel && knownModels?.has(activeModel) ? activeModel : "";
+  const configMain = configMainModel && knownModels?.has(configMainModel) ? configMainModel : "";
+  const runtimeSelected = Boolean(active && configMain && active !== configMain);
+
+  if (runtimeSelected) return active;
   if (requested && !goCampVisionCompactBlocked(config, requested)) return requested;
   if (requested && goCampVisionCompactBlocked(config, requested)) {
     const fallback = fallbackModel && knownModels?.has(fallbackModel) ? fallbackModel : "";
     if (fallback && !goCampVisionCompactBlocked(config, fallback)) return fallback;
   }
+  if (active) return active;
   return requested || fallbackModel || "";
 }
 
@@ -1055,14 +1059,99 @@ export function adaptImageUrlShape(input, shape) {
   return changed ? out : input;
 }
 
+const MOONSHOT_SCHEMA_REF_SIBLINGS = new Set(["description", "title", "default", "examples"]);
+
+function resolveJsonSchemaRef(ref, root) {
+  if (typeof ref !== "string" || !ref.startsWith("#/")) return null;
+  let node = root;
+  for (const part of ref.slice(2).split("/")) {
+    node = node?.[part];
+  }
+  return node && typeof node === "object" && !Array.isArray(node) ? structuredClone(node) : null;
+}
+
+// Kimi/Moonshot rejects JSON Schema where a $ref node also carries type on the
+// parent instead of the referenced definition. Codex MCP tools often emit that
+// shape via $defs.__schemaN entries, so dereference and strip the sibling keys.
+export function normalizeMoonshotJsonSchema(schema, { root, depth = 0, seen } = {}) {
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) {
+    return schema.map((item) => normalizeMoonshotJsonSchema(item, { root, depth, seen }));
+  }
+  if (depth > 32) return schema;
+
+  const docRoot = root ?? schema;
+  const refSeen = seen ?? new Set();
+
+  if (typeof schema.$ref === "string") {
+    const ref = schema.$ref;
+    if (refSeen.has(ref)) {
+      return { type: "object", additionalProperties: true };
+    }
+    refSeen.add(ref);
+    const resolved = resolveJsonSchemaRef(ref, docRoot);
+    const extras = {};
+    for (const [key, value] of Object.entries(schema)) {
+      if (key === "$ref" || key === "type") continue;
+      if (MOONSHOT_SCHEMA_REF_SIBLINGS.has(key)) extras[key] = value;
+    }
+    const normalized = normalizeMoonshotJsonSchema(
+      resolved ? { ...resolved, ...extras } : { type: "object", additionalProperties: false },
+      { root: docRoot, depth: depth + 1, seen: refSeen },
+    );
+    refSeen.delete(ref);
+    return normalized;
+  }
+
+  const out = { ...schema };
+  delete out.$defs;
+  delete out.definitions;
+
+  if (out.properties && typeof out.properties === "object") {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([key, value]) => [
+        key,
+        normalizeMoonshotJsonSchema(value, { root: docRoot, depth: depth + 1, seen: refSeen }),
+      ]),
+    );
+  }
+  if (out.patternProperties && typeof out.patternProperties === "object") {
+    out.patternProperties = Object.fromEntries(
+      Object.entries(out.patternProperties).map(([key, value]) => [
+        key,
+        normalizeMoonshotJsonSchema(value, { root: docRoot, depth: depth + 1, seen: refSeen }),
+      ]),
+    );
+  }
+  if (out.items) {
+    out.items = normalizeMoonshotJsonSchema(out.items, { root: docRoot, depth: depth + 1, seen: refSeen });
+  }
+  if (out.additionalProperties && typeof out.additionalProperties === "object") {
+    out.additionalProperties = normalizeMoonshotJsonSchema(
+      out.additionalProperties,
+      { root: docRoot, depth: depth + 1, seen: refSeen },
+    );
+  }
+  for (const combiner of ["allOf", "anyOf", "oneOf"]) {
+    if (Array.isArray(out[combiner])) {
+      out[combiner] = out[combiner].map((part) => normalizeMoonshotJsonSchema(
+        part,
+        { root: docRoot, depth: depth + 1, seen: refSeen },
+      ));
+    }
+  }
+  return out;
+}
+
 // OpenCode Go rejects function tools whose parameters schema is missing or not
 // type:"object" (Codex MCP children often carry inputSchema instead of parameters).
-function normalizeFunctionTool(tool) {
+function normalizeFunctionTool(tool, { moonshotSchema = false } = {}) {
   if (!tool || typeof tool !== "object") return tool;
   const parameters = tool.parameters ?? tool.inputSchema;
-  const normalized = parameters && typeof parameters === "object" && parameters.type === "object"
+  let normalized = parameters && typeof parameters === "object" && parameters.type === "object"
     ? parameters
     : { type: "object", properties: {}, additionalProperties: false };
+  if (moonshotSchema) normalized = normalizeMoonshotJsonSchema(normalized);
   const next = { ...tool, type: "function", parameters: normalized };
   delete next.inputSchema;
   return next;
@@ -1071,7 +1160,7 @@ function normalizeFunctionTool(tool) {
 // Tool policy: keep standard function/custom tools, flatten MCP namespaces so
 // text models see plain functions, and strip hosted schemas plus tools the model
 // cannot use. Returns the filtered list and a report of what was removed.
-export function applyToolPolicy(tools, { hiddenToolNames = TEXT_MODEL_HIDDEN_TOOLS } = {}) {
+export function applyToolPolicy(tools, { hiddenToolNames = TEXT_MODEL_HIDDEN_TOOLS, moonshotSchema = false } = {}) {
   if (!Array.isArray(tools)) return { tools, stripped: { toolSearch: 0, webSearch: 0, otherHosted: 0, hidden: 0, namespaceChildren: 0 } };
   const hidden = new Set(hiddenToolNames || []);
   const stripped = { toolSearch: 0, webSearch: 0, otherHosted: 0, hidden: 0, namespaceChildren: 0 };
@@ -1091,7 +1180,7 @@ export function applyToolPolicy(tools, { hiddenToolNames = TEXT_MODEL_HIDDEN_TOO
           continue;
         }
         stripped.namespaceChildren += 1;
-        out.push(normalizeFunctionTool({ ...structuredClone(child), type: "function", name: `${tool.name}__${child.name}` }));
+        out.push(normalizeFunctionTool({ ...structuredClone(child), type: "function", name: `${tool.name}__${child.name}` }, { moonshotSchema }));
       }
       continue;
     }
@@ -1105,7 +1194,7 @@ export function applyToolPolicy(tools, { hiddenToolNames = TEXT_MODEL_HIDDEN_TOO
       stripped.hidden += 1;
       continue;
     }
-    out.push(tool.type === "function" ? normalizeFunctionTool(structuredClone(tool)) : structuredClone(tool));
+    out.push(tool.type === "function" ? normalizeFunctionTool(structuredClone(tool), { moonshotSchema }) : structuredClone(tool));
   }
   return { tools: out, stripped };
 }
@@ -2208,6 +2297,7 @@ export async function relayCompaction(payload, res, services, { signal } = {}, v
     activeModel,
     requestedModel,
     fallbackModel: config.mainModel,
+    configMainModel: config.mainModel,
   });
   const route = {
     model: compactModel,
@@ -2529,6 +2619,7 @@ export async function relayResponses(payload, res, services, { signal } = {}) {
   // routing may not be the one the client asked for.
   const { tools, stripped } = applyToolPolicy(normalizedPayload.tools, {
     hiddenToolNames: hiddenToolsFor(Boolean(modelEntryFor(config, normalizedPayload.model)?.supportsVision)),
+    moonshotSchema: target.provider === "kimi",
   });
   if (tools !== normalizedPayload.tools) normalizedPayload.tools = tools;
 
